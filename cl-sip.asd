@@ -34,6 +34,18 @@
       :components ((:file "packet") (:file "g711") (:file "dtmf") (:file "session"))))))
   :in-order-to ((test-op (test-op "cl-sip/test"))))
 
+(defsystem "cl-sip/examples"
+  :depends-on ("cl-sip")
+  :serial t
+  :components
+  ((:module "examples"
+    :serial t
+    :components
+    ((:file "package")
+     (:file "register")
+     (:file "echo-uas")
+     (:file "call")))))
+
 (defsystem "cl-sip/test"
   :depends-on ("cl-sip" "fiveam")
   :serial t

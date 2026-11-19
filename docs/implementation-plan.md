@@ -16,7 +16,7 @@ phases in build order, and how each phase is verified.
 | Transactions (all four machines) | RFC 3261 §17, RFC 6026, RFC 4320 | With the Accepted state and timers L/M |
 | Dialogs | RFC 3261 §12 | Route sets, loose and strict routing, CSeq tracking |
 | UA core: REGISTER, INVITE, ACK, BYE, CANCEL, OPTIONS | RFC 3261 §8–§15, RFC 5407 | UAC and UAS roles, re-INVITE, glare (491) |
-| Digest authentication, client and server | RFC 3261 §22, RFC 7616, RFC 8760 | MD5, SHA-256, SHA-512-256, `-sess` variants, `auth` and `auth-int` |
+| Digest authentication, client and server | RFC 3261 §22, RFC 7616, RFC 8760 | MD5, SHA-256, `-sess` variants, `auth` and `auth-int` |
 | SDP | RFC 8866 | Parse, serialize, attribute helpers |
 | Offer/answer | RFC 3264, RFC 4317 | Audio streams, direction, hold, rejected streams |
 | RTP basics | RFC 3550, RFC 3551, RFC 4733 | Packet codec, G.711 µ-law/A-law, telephone-event, simple UDP session |
@@ -80,8 +80,8 @@ Consequences:
 
 - No locks inside the protocol code; state machines are plain sequential code.
 - Application callbacks run on the loop thread and may call back into the API
-  freely. Blocking convenience wrappers (`register-sync`, `call-wait`) are
-  for *other* threads and wait on a condition variable.
+  freely. Public API calls made from *other* threads are posted to the loop
+  and wait for the result; `wait-until` polls for a state from such threads.
 - **Tests run the loop by hand.** With a virtual clock and an in-memory
   transport, a test steps events and advances time explicitly, so every timer
   in §17 can be exercised deterministically and instantly.
@@ -114,12 +114,11 @@ src/
   serializer.lisp      message -> octets
   auth.lisp            digest challenge/credentials, client + server side
   scheduler.lisp       clock, timers, event queue
-  transport.lisp       transport protocol, resolution, via handling
+  transport.lisp       stack object, transport protocol, resolution, via handling
   transport-memory.lisp  in-process transport for tests
   transport-udp.lisp
   transport-tcp.lisp
   transaction.lisp     four state machines + matching
-  stack.lisp           ties transports, timers, transactions together
   dialog.lisp
   ua.lisp              UA core: request dispatch, UAS checks, OPTIONS
   registration.lisp    REGISTER client + in-memory registrar
@@ -132,8 +131,8 @@ src/
   rtp/session.lisp
 t/
   package.lisp, harness.lisp (virtual clock, wired stack pairs)
-  uri.lisp, message.lisp, torture.lisp, auth.lisp, transaction.lisp,
-  dialog.lisp, ua.lisp, sdp.lisp, rtp.lisp, udp.lisp
+  uri.lisp, message.lisp (incl. torture tests), auth.lisp, transaction.lisp,
+  dialog.lisp, ua.lisp, sdp.lisp, rtp.lisp, sockets.lisp (UDP, TCP, RTP)
 examples/
   register.lisp, echo-uas.lisp, call.lisp
 ```
@@ -238,7 +237,7 @@ in the order given.
   `Proxy-Authenticate`, `Authorization`, `Proxy-Authorization`,
   `Authentication-Info`).
 - Response computation for MD5, MD5-sess, SHA-256, SHA-256-sess,
-  SHA-512-256, SHA-512-256-sess; qop `auth`, `auth-int`, and none
+  qop `auth`, `auth-int`, and none
   (RFC 2069 form).
 - Client: a credential store keyed by realm; when several
   challenges are offered, use the first one whose algorithm is supported
@@ -370,7 +369,7 @@ TU interface: a transaction holds a `tu` function called with
 - Response processing (§8.1.3): more than one Via → discard; unknown final
   status treated as x00; 401/407 → retry once per challenge with
   credentials, new branch, CSeq + 1, same Call-ID and From tag (§22.2);
-  3xx → reported to the application (and optionally followed for INVITE);
+  3xx → reported to the application, which may call the new target;
   408/timeout/503 mapping (§8.1.3.1, RFC 4320 §4.2).
 - UAS request processing (§8.2) in order: method (405 + Allow) → Require
   (420 + Unsupported) → merged request (482) → dialog lookup (481 for
@@ -425,9 +424,8 @@ and remote SDP, termination cause.
   real UDP on localhost.
 
 ### Phase 9 — SDP and offer/answer
-- `session-description` and `media-description` structs covering every line
-  type in RFC 8866 §5 (`v o s i u e p c b t r z k a m`), strict about order
-  when parsing, tolerant of bare-LF line endings.
+- `session` and `media` structs covering every line type in RFC 8866 §5
+  (`v o s i u e p c b t r z k a m`), tolerant of bare-LF line endings.
 - Attribute helpers: `rtpmap`, `fmtp`, `ptime`, direction
   (`sendrecv`/`sendonly`/`recvonly`/`inactive`), lookup with session-level
   fallback.
@@ -467,12 +465,12 @@ and remote SDP, termination cause.
 ```lisp
 (defvar *ua*
   (cl-sip:make-user-agent :aor "sip:alice@example.com"
-                          :transports '((:udp :port 5060))
+                          :transports '((:udp :host "0.0.0.0" :port 5060))
                           :credentials '(("example.com" "alice" "secret"))))
 (cl-sip:start *ua*)
 
 (cl-sip:register *ua* :expires 3600
-                 :on-event (lambda (reg event &key) ...))  ; :registered :failed :expired
+                 :on-event (lambda (reg event &key) ...))  ; :registered :unregistered :bindings :failed
 
 (setf (cl-sip:ua-on-incoming-call *ua*)
       (lambda (call) (cl-sip:ring call) (cl-sip:answer call :sdp answer)))
@@ -513,3 +511,28 @@ and remote SDP, termination cause.
    requires; header and parameter names are case-insensitive.
 5. **No proxy.** The transaction and transport layers are written without
    UA assumptions so a proxy core could be added on top later.
+
+## 9. Status
+
+All eleven phases are implemented and covered by the test suite
+(`(asdf:test-system "cl-sip")`, 662 checks). Where the result differs from
+the plan above:
+
+- **Digest algorithms:** MD5 and SHA-256 (plain and `-sess`). SHA-512-256
+  from RFC 7616 is not offered because the installed ironclad has no
+  SHA-512/256 digest; a challenge using it is skipped in favour of the next
+  one the server lists.
+- **Message size:** the rule of RFC 3261 §18.1.1 that a request within 200
+  bytes of the path MTU must switch to a congestion-controlled transport is
+  not implemented. A request goes out on the transport its URI selects.
+- **Redirects:** a 3xx ends the call with cause `:rejected` and the response
+  attached; following the Contact is left to the application.
+- **Offer/answer:** an answer accepts the first usable audio stream and
+  rejects every other stream, including further audio streams.
+- **Early media and forking:** an early dialog is tracked per call, and a
+  2xx from a second fork is acknowledged and released with BYE, but several
+  simultaneous early dialogs are not kept side by side.
+- **RFC 4475:** the parser tests transcribe a subset of the torture messages
+  (listed in `t/message.lisp`); the full set is not included.
+- **RTP:** `rtp-send-dtmf` sends the packets of a digit as one burst rather
+  than pacing them 20 ms apart.
