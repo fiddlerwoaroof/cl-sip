@@ -34,6 +34,21 @@
       :components ((:file "packet") (:file "g711") (:file "dtmf") (:file "session"))))))
   :in-order-to ((test-op (test-op "cl-sip/test"))))
 
+(defsystem "cl-sip/voice"
+  :description "Talk to a language model over a SIP call."
+  :depends-on ("cl-sip" "com.inuoe.jzon")
+  :serial t
+  :components
+  ((:module "src/voice"
+    :serial t
+    :components
+    ((:file "package")
+     (:file "audio")
+     (:file "vad")
+     (:file "backends")
+     (:file "agent")
+     (:file "server")))))
+
 (defsystem "cl-sip/examples"
   :depends-on ("cl-sip")
   :serial t
@@ -47,7 +62,7 @@
      (:file "call")))))
 
 (defsystem "cl-sip/test"
-  :depends-on ("cl-sip" "fiveam")
+  :depends-on ("cl-sip" "cl-sip/voice" "fiveam")
   :serial t
   :components
   ((:module "t"
@@ -63,6 +78,7 @@
      (:file "ua")
      (:file "sdp")
      (:file "rtp")
-     (:file "sockets"))))
+     (:file "sockets")
+     (:file "voice"))))
   :perform (test-op (o c) (unless (symbol-call :cl-sip.test :run-all)
                             (error "cl-sip tests failed"))))

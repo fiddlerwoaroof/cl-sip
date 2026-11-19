@@ -536,3 +536,39 @@ the plan above:
   (listed in `t/message.lisp`); the full set is not included.
 - **RTP:** `rtp-send-dtmf` sends the packets of a digit as one burst rather
   than pacing them 20 ms apart.
+
+## 10. Voice agent (added after the plan)
+
+`cl-sip/voice` puts a language model on the end of a call. It was not part
+of the original plan; the design in brief:
+
+```
+softphone ──SIP──▶ phone server (registrar + dialplan) ──▶ voice agent
+   ▲                                                          │
+   └────────────── RTP (G.711) ◀── paced audio out ◀── TTS ◀──┤
+                         │                                    │
+                         └─▶ decode ─▶ VAD ─▶ STT ─▶ Claude ──┘
+```
+
+- **Server** (`server.lisp`): a UA with a registrar; each INVITE is routed
+  by the user part of its Request-URI through a dialplan to the agent, an
+  echo, or an announcement. RTP is symmetric (it sends to wherever the
+  caller's packets come from).
+- **Turn taking** (`vad.lisp`, `agent.lisp`): an energy gate cuts the
+  caller's audio into utterances (start after 60 ms of speech, end after
+  700 ms of quiet). A worker thread handles one turn at a time. Speech that
+  starts while the agent is talking bumps a generation counter, which drops
+  queued audio and abandons the reply in progress.
+- **Backends** (`backends.lisp`): three generic functions, `transcribe`,
+  `respond`, `synthesize`. The defaults are whisper.cpp (`whisper-cli`),
+  Claude Haiku 5.5 over the Messages API, and macOS `say`.
+- **Claude** is called through `curl` with `stream: true`; text deltas are
+  cut into sentences and each is synthesized and queued as soon as it is
+  complete, so speech starts with the first sentence. Thinking is off and
+  effort is `low` to keep the first word quick. The API key is passed to
+  curl on standard input, not on the command line. There is no realtime
+  speech API for Claude, hence the pipeline.
+- **Not done yet:** calls between two registered phones (needs a
+  back-to-back UA with an RTP relay), DTMF input, a voice-cloning TTS
+  backend (the `command-tts` hook is there for one), and conversation
+  length limits.

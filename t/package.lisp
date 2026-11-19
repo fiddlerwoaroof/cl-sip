@@ -1,6 +1,7 @@
 (defpackage :cl-sip.test
   (:use :cl :fiveam)
-  (:local-nicknames (:sip :cl-sip) (:sdp :cl-sip.sdp) (:rtp :cl-sip.rtp))
+  (:local-nicknames (:sip :cl-sip) (:sdp :cl-sip.sdp) (:rtp :cl-sip.rtp)
+                    (:voice :cl-sip.voice))
   (:export #:run-all))
 
 (in-package :cl-sip.test)

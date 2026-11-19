@@ -1,0 +1,21 @@
+#!/bin/sh
+# Start the phone server: softphones that call it talk to a Claude model.
+#
+#   direnv exec . bin/voice-server
+#
+# Needs ANTHROPIC_API_KEY, and whisper-cli, curl and WHISPER_MODEL from the
+# flake's dev shell.  VOICE_HOST and VOICE_PORT override 127.0.0.1:5060;
+# use VOICE_HOST=0.0.0.0 to accept phones on the local network.
+cd "$(dirname "$0")/.." || exit 1
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+  echo "warning: ANTHROPIC_API_KEY is not set; the agent will not be able to answer" >&2
+fi
+exec sbcl --noinform \
+  --eval '(require :asdf)' \
+  --eval '(unless (find-package :ql) (load "~/quicklisp/setup.lisp"))' \
+  --eval '(push (truename ".") asdf:*central-registry*)' \
+  --eval '(ql:quickload "cl-sip/voice" :silent t)' \
+  --eval '(cl-sip.voice:start-server
+           :host (or (uiop:getenv "VOICE_HOST") "127.0.0.1")
+           :port (parse-integer (or (uiop:getenv "VOICE_PORT") "5060")))' \
+  --eval '(loop (sleep 3600))'

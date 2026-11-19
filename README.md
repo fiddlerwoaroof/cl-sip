@@ -14,7 +14,8 @@ the full scope, and the list of what is left out.
 ## Loading
 
 Dependencies: `alexandria`, `babel`, `bordeaux-threads`, `ironclad`,
-`usocket` (and `fiveam` for the tests), all in Quicklisp. Developed on SBCL.
+`usocket` (plus `com.inuoe.jzon` for `cl-sip/voice` and `fiveam` for the
+tests), all in Quicklisp. Developed on SBCL.
 
 ```lisp
 (push #p"/path/to/cl-sip/" asdf:*central-registry*)
@@ -77,6 +78,66 @@ and `call-example` (calls a URI, sends a tone and a DTMF digit).
 ;; => :LOCAL-HANGUP, 57
 ```
 
+## Calling a model from a softphone
+
+`cl-sip/voice` is a small phone server. A softphone registers with it (or
+just dials it), and the call is answered by a voice agent: the caller's
+speech is transcribed locally with whisper.cpp, sent to Claude Haiku 5.5
+through the Messages API, and the streamed reply is spoken back sentence by
+sentence. Talking over the agent interrupts it.
+
+The tools come from the flake's dev shell (`whisper-cli`, `curl`, the whisper
+model as `$WHISPER_MODEL`, and `pjsua` for testing); speech is synthesized
+with the macOS `say` command. The server needs `ANTHROPIC_API_KEY` in its
+environment.
+
+```sh
+direnv exec . bin/voice-server          # listens on 127.0.0.1:5060, UDP and TCP
+```
+
+or from a REPL started inside the dev shell:
+
+```lisp
+(ql:quickload "cl-sip/voice")
+(defvar *server* (cl-sip.voice:start-server))
+(cl-sip.voice:stop-server *server*)
+```
+
+Then point a softphone on the same Mac at it:
+
+| Setting | Value |
+|---|---|
+| SIP server / domain | `127.0.0.1` (port 5060) |
+| User name | anything, e.g. `100` |
+| Password | anything (registration is open unless `:users` is given) |
+| Transport | UDP or TCP |
+| Encryption (SRTP, TLS) | off |
+
+and dial:
+
+| Extension | What answers |
+|---|---|
+| `600` | Echo test: you hear yourself |
+| `700` | A spoken test message, then it hangs up |
+| anything else | The voice agent |
+
+The routing is the `:dialplan` argument (see `*default-dialplan*`): patterns
+map to `:agent`, `:echo`, `(:say "text")`, `(:play "file.wav")`,
+`(:reject status)` or a function of your own. To reach it from another
+device on your network, start it with `VOICE_HOST=0.0.0.0`; there is no
+authentication on calls, so keep it off untrusted networks.
+
+Each stage is replaceable: `start-server` takes `:stt`, `:llm` and `:tts`
+objects. `make-claude-llm` accepts `:model`, `:system` and `:effort`;
+`make-say-tts` accepts `:voice`; and `make-command-tts` runs any program
+that writes a WAV file, which is the hook for a local voice-cloning model:
+
+```lisp
+(cl-sip.voice:start-server
+ :tts (cl-sip.voice:make-command-tts
+       '("my-tts" "--voice" "me.wav" "--text" :text "--out" :output)))
+```
+
 ## Layout
 
 | Path | Contents |
@@ -89,6 +150,7 @@ and `call-example` (calls a URI, sends a tone and a DTMF digit).
 | `src/dialog.lisp`, `ua.lisp`, `registration.lisp`, `call.lisp` | Dialogs and the UA core |
 | `src/sdp/` | Package `cl-sip.sdp`: SDP and offer/answer |
 | `src/rtp/` | Package `cl-sip.rtp`: RTP packets, G.711, DTMF, a simple session |
+| `src/voice/` | Package `cl-sip.voice`: audio helpers, voice agent, phone server |
 | `t/` | Tests; protocol tests run on a virtual clock over an in-memory network |
 
 ## Testing without a network
