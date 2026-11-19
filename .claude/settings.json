@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.envrc)",
+      "Edit(./.envrc)",
+      "Read(./.envrc.local)",
+      "Edit(./.envrc.local)"
+    ]
+  }
+}
