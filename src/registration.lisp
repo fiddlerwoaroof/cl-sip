@@ -247,11 +247,15 @@ step 4).")
    (default-expires :initarg :default-expires :initform 3600
                     :accessor registrar-default-expires)
    (max-expires :initarg :max-expires :initform 7200 :accessor registrar-max-expires)
+   (on-change :initarg :on-change :initform nil :accessor registrar-on-change
+              :documentation "(lambda (user contacts)) called when the addresses
+registered for USER change; CONTACTS are the URIs now registered.")
    (nonces :initform (make-hash-table :test #'equal) :reader registrar-nonces)))
 
 (defun make-registrar (&rest args &key realm users algorithm min-expires
-                                    default-expires max-expires strict)
-  (declare (ignore realm users algorithm min-expires default-expires max-expires strict))
+                                    default-expires max-expires strict on-change)
+  (declare (ignore realm users algorithm min-expires default-expires max-expires strict
+                   on-change))
   (apply #'make-instance 'registrar args))
 
 (defun aor-key (uri)
@@ -383,7 +387,16 @@ otherwise a 401 has been sent."
                                                         c)
                                              :expires-at (+ now expires)
                                              :call-id call-id :cseq cseq)))))))))
-        (setf (gethash key (registrar-bindings registrar)) current)
+        (let ((before (mapcar (lambda (b) (uri-string (name-addr-uri (binding-contact b))))
+                              (gethash key (registrar-bindings registrar))))
+              (after (mapcar (lambda (b) (uri-string (name-addr-uri (binding-contact b))))
+                             current)))
+          (setf (gethash key (registrar-bindings registrar)) current)
+          (when (and (registrar-on-change registrar)
+                     (set-exclusive-or before after :test #'string=))
+            (ignore-errors
+             (funcall (registrar-on-change registrar)
+                      (sip-uri-user (name-addr-uri (msg-to request))) after))))
         (ua-respond
          ua tx request 200
          :headers (append

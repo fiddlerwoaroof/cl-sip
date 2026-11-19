@@ -425,8 +425,16 @@ a STUN server (\"host:port\")."
               (error (e)
                 (server-log server "error handling call: ~a" e)
                 (ignore-errors (sip:reject call 500))))))
+    (setf (sip:registrar-on-change (sip:ua-registrar ua))
+          (lambda (user contacts)
+            (server-log server "phone ~a: ~:[no longer registered~;registered at ~:*~{~a~^, ~}~]"
+                        user contacts)))
     (sip:start ua)
     (server-log server "listening on ~a:~d" host (server-port server))
+    (if extensions
+        (server-log server "extensions: ~{~a~^, ~}" (mapcar #'extension-label extensions))
+        (server-log server "no extension list: phones can register and call, but ~
+nothing can ring them"))
     (when trunk
       (when (sip:cidr-match-p host "127.0.0.0/8")
         (server-log server "warning: bound to ~a, which a trunk on the internet cannot reach"

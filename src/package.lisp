@@ -86,7 +86,7 @@
    #:registration-state #:registration-expires #:registration-bindings
    #:registration-last-response #:registration-on-event
    #:registrar #:make-registrar #:registrar-lookup #:registrar-lookup-user
-   #:registrar-users #:registrar-realm #:registrar-min-expires #:registrar-strict
+   #:registrar-users #:registrar-realm #:registrar-min-expires #:registrar-strict #:registrar-on-change
    #:registrar-authenticate #:registrar-make-challenge
 
    ;; calls
