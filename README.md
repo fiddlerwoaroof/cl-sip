@@ -249,7 +249,12 @@ forwarding target may be an outside number if the forwarding extension is
 marked `:outbound`. This has been exercised against a stand-in provider
 only, not yet against Flowroute itself.
 
-The design and what is still to come (busy lamps) are in
+A softphone's busy lamps (BLF) can follow other extensions: the server
+answers subscriptions to the `dialog` event of an extension and reports it
+ringing, in a call, or idle.
+
+The design, the RFCs each part follows, and what is left out (voicemail and
+message waiting, call pickup, conferences, music on hold) are in
 `docs/pbx-plan.md`.
 
 ### Looking things up in the wiki

@@ -458,6 +458,8 @@ a STUN server (\"host:port\")."
                                         (null nil)
                                         (cons stun)
                                         (string (parse-host-port stun 3478))))))
+    (when extensions
+      (server-offer-dialog-events server))
     ;; Tool calls the model makes are worth seeing next to the conversation.
     (when (and (typep llm 'claude-llm) (null (llm-log llm)))
       (setf (llm-log llm)

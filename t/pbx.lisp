@@ -901,3 +901,86 @@ registration."
                           packets)))))
       (rtp:rtp-session-stop out)
       (rtp:rtp-session-stop sink))))
+
+;;; Busy lamps: dialog state of an extension (RFC 4235)
+
+(defun lamp-states (events)
+  "For each dialog document received, the states of the dialogs in it."
+  (loop for (name . args) in (funcall events)
+        when (eq name :notify)
+          collect (let ((body (or (getf args :body) "")))
+                    (loop for start = (search "<state>" body) then (search "<state>" body
+                                                                           :start2 (1+ start))
+                          while start
+                          collect (subseq body (+ start 7) (search "</state>" body
+                                                                   :start2 start))))))
+
+(test busy-lamp-rfc4235
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw")
+                    (carol "102" "carol-pw"))
+    (multiple-value-bind (on-bob bob-lamp) (recorder)
+      (multiple-value-bind (on-alice alice-lamp) (recorder)
+        ;; Carol's phone has lamps for Bob and for Alice.
+        (let ((watch-bob (sip:subscribe carol (pbx-uri server "101") "dialog"
+                                        :accept "application/dialog-info+xml"
+                                        :on-event on-bob))
+              (watch-alice (sip:subscribe carol (pbx-uri server "100") "dialog"
+                                          :on-event on-alice)))
+          (is-true (sip:wait-until (lambda () (and (lamp-states bob-lamp)
+                                                   (lamp-states alice-lamp)))))
+          (is (eq :active (sip:subscription-state watch-bob)))
+          ;; Idle: a document with no dialogs in it.
+          (is (equal '(()) (lamp-states bob-lamp)))
+          (let ((document (getf (cdr (find :notify (funcall bob-lamp) :key #'car)) :body)))
+            (is (search "urn:ietf:params:xml:ns:dialog-info" document))
+            (is (search "state=\"full\"" document))
+            (is (search "entity=\"sip:101@" document)))
+          (is (string= "application/dialog-info+xml"
+                       (getf (cdr (find :notify (funcall bob-lamp) :key #'car))
+                             :content-type)))
+          ;; Alice calls Bob: his lamp shows ringing, hers that she is dialling.
+          (let* ((caller (open-desk alice))
+                 (callee (attend bob :after 1/2))
+                 (call (dial caller server "101")))
+            (is-true (sip:wait-until (lambda () (equal '(() ("early"))
+                                                       (lamp-states bob-lamp)))))
+            (is (equal '(() ("trying")) (lamp-states alice-lamp)))
+            (let ((document (getf (cdr (first (last (funcall bob-lamp)))) :body)))
+              (is (search "direction=\"recipient\"" document))
+              (is (search "<identity>sip:100@" document)))
+            ;; Answered: both are in a call.
+            (is-true (wait-for-call call :established))
+            (is-true (sip:wait-until (lambda () (equal '(() ("early") ("confirmed"))
+                                                       (lamp-states bob-lamp)))))
+            (is-true (sip:wait-until (lambda () (equal '(() ("trying") ("confirmed"))
+                                                       (lamp-states alice-lamp)))))
+            ;; Over: both idle again.
+            (sip:hangup call)
+            (is-true (wait-for-call (desk-call callee) :terminated))
+            (is-true (sip:wait-until (lambda () (equal '(() ("early") ("confirmed") ())
+                                                       (lamp-states bob-lamp)))))
+            (is-true (sip:wait-until (lambda () (equal '(() ("trying") ("confirmed") ())
+                                                       (lamp-states alice-lamp))))))
+          ;; The version counts up with each document (RFC 4235 section 4.1).
+          (is (equal '(0 1 2 3)
+                     (loop for (name . args) in (funcall bob-lamp)
+                           when (eq name :notify)
+                             collect (let* ((body (getf args :body))
+                                            (at (search "version=\"" body :start2 20)))
+                                       (parse-integer body :start (+ at 9)
+                                                           :junk-allowed t)))))
+          (sip:unsubscribe watch-bob)
+          (sip:unsubscribe watch-alice)
+          (is-true (sip:wait-until
+                    (lambda () (null (sip:ua-event-subscriptions (voice:server-ua server)))))))))
+    ;; Only extensions may watch, and only extensions can be watched.
+    (let ((stranger (start-phone "555" "nothing")))
+      (unwind-protect
+           (flet ((refusal (ua number)
+                    (multiple-value-bind (on-event events) (recorder)
+                      (sip:subscribe ua (pbx-uri server number) "dialog" :on-event on-event)
+                      (is-true (sip:wait-until (lambda () (funcall events))))
+                      (getf (cdr (first (funcall events))) :status))))
+             (is (= 401 (refusal stranger "101")))
+             (is (= 404 (refusal carol "999"))))
+        (sip:stop stranger)))))

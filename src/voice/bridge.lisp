@@ -28,6 +28,8 @@
    (told-held :initform nil :accessor leg-told-held
               :documentation "True while this leg has been offered sendonly because
 the other party is holding.")
+   (id :initform (format nil "~(~36r~)" (random (expt 36 10))) :reader leg-id
+       :documentation "Names this leg in dialog state documents (RFC 4235).")
    (extension :initarg :extension :initform nil :accessor leg-extension
               :documentation "The extension at the far end, when it is one.")
    (party :initarg :party :initform nil :accessor leg-party
@@ -221,7 +223,8 @@ answers, and ON-ANSWERED decides what happens.")
 (defun bridge-forget (bridge)
   (sip:cancel-timer (bridge-timer bridge))
   (setf (server-bridges (bridge-server bridge))
-        (remove bridge (server-bridges (bridge-server bridge)))))
+        (remove bridge (server-bridges (bridge-server bridge))))
+  (server-publish-dialogs (bridge-server bridge)))
 
 (defun bridge-drop-forks (bridge &key headers except)
   "Stop ringing every outgoing leg but EXCEPT."
@@ -313,7 +316,8 @@ ringback from a telephone network): let the caller hear it."
        (setf (bridge-early bridge) nil)
        (sip:answer (leg-call a) :sdp (leg-sdp-text a))
        (legs-connect a leg)
-       (bridge-log bridge "answered")))))
+       (bridge-log bridge "answered")
+       (server-publish-dialogs (bridge-server bridge))))))
 
 (defun bridge-failure (outcomes)
   "The status and reason to give the caller when every leg ended as in
@@ -334,9 +338,10 @@ anything else means nobody is available."
      (when (eq leg (bridge-early bridge))
        (leg-disconnect (bridge-a bridge))
        (setf (bridge-early bridge) nil))
-     (when (and (eq (bridge-state bridge) :calling) (null (bridge-forks bridge)))
-       (multiple-value-call #'bridge-fail bridge
-         (bridge-failure (bridge-outcomes bridge)))))))
+     (if (and (eq (bridge-state bridge) :calling) (null (bridge-forks bridge)))
+         (multiple-value-call #'bridge-fail bridge
+           (bridge-failure (bridge-outcomes bridge)))
+         (server-publish-dialogs (bridge-server bridge))))))
 
 ;;; Changes during the call (RFC 3264 section 8, RFC 6337, RFC 5359 section 2.1)
 
@@ -447,6 +452,7 @@ it is not touched, and ON-ANSWERED is called with the leg that answers."
           (sip:schedule (sip:ua-scheduler ua) ring-seconds
                         (lambda () (bridge-fail bridge 480 :no-answer))))
     (bridge-log bridge "ringing ~d phone~:p" (length targets))
+    (server-publish-dialogs server)
     bridge))
 
 ;;; Transfer (RFC 5589; RFC 5359 sections 2.4 and 2.5)
@@ -491,7 +497,8 @@ that stays is now talking to NEW."
     (setf (sip:call-on-event (leg-call old)) nil)
     (sip:hangup (leg-call old))
     (leg-close old)
-    (bridge-log bridge "transferred: now ~a and ~a" (leg-label keep) (leg-label new))))
+    (bridge-log bridge "transferred: now ~a and ~a" (leg-label keep) (leg-label new))
+    (server-publish-dialogs (bridge-server bridge))))
 
 (defun bridge-detach-leg (bridge leg)
   "Take LEG out of a connected BRIDGE for use elsewhere; the bridge is
@@ -870,3 +877,96 @@ the trunk never go back out by themselves: that is how toll fraud works."
           (t
            (leg-close a)
            (sip:reject call 488)))))
+
+;;; Busy lamps: the state of an extension's calls (RFC 4235, over RFC 6665)
+
+(defun extension-dialogs (server extension)
+  "The bridged calls EXTENSION's phones are in, each as (id direction state
+remote): what a busy lamp for the extension shows."
+  (loop for bridge in (server-bridges server)
+        append (loop for leg in (bridge-legs bridge)
+                     for calling = (eq leg (bridge-a bridge))
+                     when (and (eq (leg-extension leg) extension)
+                               ;; The party a transfer is being rung for is
+                               ;; counted in the call it is still in.
+                               (not (and calling (bridge-established-p bridge))))
+                       collect (list (leg-id leg)
+                                     (if calling "initiator" "recipient")
+                                     (cond ((eq (bridge-state bridge) :connected) "confirmed")
+                                           (calling "trying")
+                                           (t "early"))
+                                     (cond ((eq (bridge-state bridge) :connected)
+                                            (leg-label (bridge-peer bridge leg)))
+                                           (calling nil)
+                                           (t (leg-label (bridge-a bridge))))))))
+
+(defun xml-escape (string)
+  (with-output-to-string (out)
+    (loop for c across string
+          do (case c
+               (#\& (write-string "&amp;" out))
+               (#\< (write-string "&lt;" out))
+               (#\> (write-string "&gt;" out))
+               (#\" (write-string "&quot;" out))
+               (t (write-char c out))))))
+
+(defun dialog-info-document (entity version dialogs)
+  "RFC 4235 section 4: the full state of ENTITY's dialogs."
+  (with-output-to-string (out)
+    (format out "<?xml version=\"1.0\"?>~%")
+    (format out "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\" ~
+                 version=\"~d\" state=\"full\" entity=\"~a\">~%"
+            version (xml-escape entity))
+    (loop for (id direction state remote) in dialogs
+          do (format out "  <dialog id=\"~a\" direction=\"~a\">~%    <state>~a</state>~%"
+                     id direction state)
+             (when remote
+               (format out "    <remote><identity>~a</identity></remote>~%"
+                       (xml-escape remote)))
+             (format out "  </dialog>~%"))
+    (format out "</dialog-info>~%")))
+
+(defun subscription-extension (server subscription)
+  (let ((uri (sip:subscription-resource subscription)))
+    (find-extension (server-extensions server) (normalize-number (uri-user uri)))))
+
+(defun server-dialog-document (server subscription)
+  "The document for SUBSCRIPTION, or NIL when it names no extension."
+  (let ((extension (subscription-extension server subscription)))
+    (when extension
+      (let ((dialogs (extension-dialogs server extension)))
+        ;; Remembered, so that only changes are published.
+        (setf (sip:subscription-user-data subscription) (list dialogs))
+        (dialog-info-document
+         (sip:uri-string (sip:name-addr-uri
+                          (server-identity server (extension-number extension))))
+         (sip:subscription-version subscription)
+         dialogs)))))
+
+(defun server-publish-dialogs (server)
+  "Notify whoever watches an extension whose calls have changed."
+  (dolist (subscription (sip:ua-event-subscriptions (server-ua server) "dialog"))
+    (let ((extension (subscription-extension server subscription)))
+      (when (and extension
+                 (not (equal (list (extension-dialogs server extension))
+                             (sip:subscription-user-data subscription))))
+        (sip:subscription-notify subscription)))))
+
+(defun server-offer-dialog-events (server)
+  "Let authenticated phones subscribe to the dialog state of extensions."
+  (let* ((ua (server-ua server))
+         (registrar (sip:ua-registrar ua)))
+    (sip:ua-add-event-package
+     ua "dialog"
+     :content-type "application/dialog-info+xml"
+     :authorize (lambda (subscription request)
+                  (declare (ignore subscription))
+                  (multiple-value-bind (user problem)
+                      (sip:registrar-authenticate registrar request)
+                    (if (and user (find-extension (server-extensions server) user))
+                        t
+                        (values nil 401
+                                `(("WWW-Authenticate"
+                                   ,(sip:registrar-make-challenge
+                                     registrar :stale (eq problem :stale))))))))
+     :body (lambda (subscription) (server-dialog-document server subscription)))))

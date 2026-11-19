@@ -152,7 +152,12 @@ as the voice tests do. No phase needs a real softphone or the real trunk.
 
 - SUBSCRIBE/NOTIFY core with expiry and refresh.
 - `dialog` event package for an extension, so a softphone's busy lamp
-  follows it: `dialog-info+xml` with early / confirmed / terminated.
+  follows it: a full `dialog-info+xml` document on every change, with
+  `trying` (dialling), `early` (ringing) and `confirmed`; an idle extension
+  has no dialogs. Only bridged calls are shown: a call to the agent or an
+  announcement is not, yet.
+- Subscribers authenticate as an extension; any extension may watch any
+  other.
 
 ### Not planned yet
 
@@ -175,4 +180,4 @@ Updated as phases land.
 | 4 Forwarding | done |
 | 5 Transfer | done, except INVITE with Replaces |
 | 6 Dialling out | done in simulation; not yet tried against Flowroute |
-| 7 Events | planned |
+| 7 Events | done |
