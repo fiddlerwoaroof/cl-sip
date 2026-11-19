@@ -1,21 +1,198 @@
-#!/bin/sh
-# Start the phone server: softphones that call it talk to a Claude model.
+#!/usr/bin/env bash
+# Start the phone server: softphones that call it, and callers of your
+# Flowroute number if one is configured, talk to a Claude model.
 #
-#   direnv exec . bin/voice-server
+#   bin/voice-server            check the configuration, then run
+#   bin/voice-server --check    check only
 #
-# Needs ANTHROPIC_API_KEY, and whisper-cli, curl and WHISPER_MODEL from the
-# flake's dev shell.  Everything else is configured through environment
-# variables; see start-server-from-environment in src/voice/server.lisp, or
-# the README.  Setting FLOWROUTE_USERNAME and FLOWROUTE_PASSWORD connects
-# the server to Flowroute.
+# The script loads the dev environment itself (direnv, or nix develop), reads
+# .envrc.local if there is one, verifies the settings below, and starts the
+# server.  Values are never printed.
+#
+#   Required
+#     ANTHROPIC_API_KEY        key for the Claude API
+#
+#   Flowroute trunk (set both, or neither for softphone-only use)
+#     FLOWROUTE_USERNAME       the tech prefix (Interconnections > Registration)
+#     FLOWROUTE_PASSWORD       the SIP password shown there
+#     FLOWROUTE_POP            us-west-or (default) or us-east-va
+#     VOICE_RTP_PORTS          UDP range forwarded by your router, e.g. 40000-40019
+#     VOICE_STUN               or a STUN server, host:port
+#     VOICE_ALLOWED_CALLERS    comma-separated numbers the agent will answer
+#     VOICE_MAX_CALLS          agent calls at once (default 2)
+#
+#   Optional
+#     VOICE_HOST, VOICE_PORT   listen address (127.0.0.1, or 0.0.0.0 with a
+#                              trunk; port 5060)
+#     VOICE_ALLOW              comma-separated networks whose phones may call
+#     VOICE_TTS                "chatterbox" for the cloned-voice model
+#     VOICE_REFERENCE          recording of the voice for Chatterbox to imitate
+
+set -u
 cd "$(dirname "$0")/.." || exit 1
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-  echo "warning: ANTHROPIC_API_KEY is not set; the agent will not be able to answer" >&2
+repo=$PWD
+
+check_only=0
+case "${1:-}" in
+  --check) check_only=1 ;;
+  -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") ;;
+  *) echo "usage: bin/voice-server [--check]" >&2; exit 2 ;;
+esac
+
+# --- Environment -----------------------------------------------------------
+
+# The dev shell provides whisper-cli, curl and WHISPER_MODEL.  If it is not
+# loaded yet, run this script again inside it.
+if [ -z "${WHISPER_MODEL:-}" ] && [ -z "${VOICE_SERVER_REEXEC:-}" ]; then
+  export VOICE_SERVER_REEXEC=1
+  if command -v direnv >/dev/null 2>&1 && [ -f .envrc ]; then
+    exec direnv exec "$repo" "$0" "$@"
+  elif command -v nix >/dev/null 2>&1; then
+    exec nix develop "$repo" --command "$0" "$@"
+  fi
 fi
+
+# Credentials kept out of git.
+if [ -f .envrc.local ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.envrc.local
+  set +a
+fi
+
+# --- Checks ----------------------------------------------------------------
+
+errors=0
+warnings=0
+ok()   { printf '  ok       %s\n' "$1"; }
+bad()  { printf '  PROBLEM  %s\n' "$1"; errors=$((errors + 1)); }
+warn() { printf '  warning  %s\n' "$1"; warnings=$((warnings + 1)); }
+note() { printf '  -        %s\n' "$1"; }
+
+is_set()  { [ -n "${!1:-}" ]; }
+is_int()  { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+is_port() { is_int "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+need_tool() {
+  if command -v "$1" >/dev/null 2>&1; then ok "$1 found"
+  else bad "$1 not found ($2)"; fi
+}
+
+echo "Tools"
+need_tool sbcl "install SBCL"
+need_tool curl "provided by the flake dev shell"
+need_tool whisper-cli "provided by the flake dev shell"
+if is_set WHISPER_MODEL && [ -f "$WHISPER_MODEL" ]; then ok "speech recognition model present"
+else bad "WHISPER_MODEL does not name a file (the flake dev shell sets it)"; fi
+
+echo "Model"
+if is_set ANTHROPIC_API_KEY; then ok "ANTHROPIC_API_KEY is set"
+else bad "ANTHROPIC_API_KEY is not set"; fi
+
+echo "Speech"
+case "${VOICE_TTS:-say}" in
+  say)
+    need_tool say "macOS only; set VOICE_TTS=chatterbox elsewhere" ;;
+  chatterbox)
+    need_tool uv "needed to run the Chatterbox worker"
+    if is_set VOICE_REFERENCE; then
+      if [ -f "$VOICE_REFERENCE" ]; then ok "voice reference recording found"
+      else bad "VOICE_REFERENCE names a file that does not exist"; fi
+    else
+      note "no VOICE_REFERENCE: Chatterbox will use its built-in voice"
+    fi ;;
+  *)
+    bad "VOICE_TTS must be \"say\" or \"chatterbox\"" ;;
+esac
+
+echo "Trunk"
+trunk=0
+if is_set FLOWROUTE_USERNAME && is_set FLOWROUTE_PASSWORD; then
+  trunk=1
+  ok "Flowroute credentials are set"
+  case "${FLOWROUTE_POP:-us-west-or}" in
+    us-west-or|us-east-va) ok "point of presence: ${FLOWROUTE_POP:-us-west-or}" ;;
+    *) bad "FLOWROUTE_POP must be us-west-or or us-east-va" ;;
+  esac
+elif is_set FLOWROUTE_USERNAME || is_set FLOWROUTE_PASSWORD; then
+  bad "set both FLOWROUTE_USERNAME and FLOWROUTE_PASSWORD, or neither"
+else
+  note "no Flowroute credentials: softphones only"
+fi
+
+if is_set VOICE_RTP_PORTS; then
+  low=${VOICE_RTP_PORTS%%-*}
+  high=${VOICE_RTP_PORTS#*-}
+  if [[ "$VOICE_RTP_PORTS" == *-* ]] && is_port "$low" && is_port "$high" \
+     && [ "$low" -le "$high" ]; then
+    ok "audio ports $VOICE_RTP_PORTS (forward this UDP range to this machine)"
+  else
+    bad "VOICE_RTP_PORTS must look like 40000-40019"
+  fi
+fi
+if is_set VOICE_STUN; then
+  if [[ "$VOICE_STUN" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then ok "STUN server $VOICE_STUN"
+  else bad "VOICE_STUN must look like host:port"; fi
+fi
+if [ "$trunk" = 1 ]; then
+  if ! is_set VOICE_RTP_PORTS && ! is_set VOICE_STUN; then
+    warn "neither VOICE_RTP_PORTS nor VOICE_STUN is set: callers may hear nothing"
+  fi
+  if is_set VOICE_ALLOWED_CALLERS; then ok "answering only the listed callers"
+  else warn "VOICE_ALLOWED_CALLERS is not set: anyone who calls the number reaches the model"; fi
+  case "${VOICE_HOST:-0.0.0.0}" in
+    127.*|localhost) bad "VOICE_HOST is loopback, which Flowroute cannot reach; unset it" ;;
+  esac
+fi
+
+echo "Listening"
+host=${VOICE_HOST:-$([ "$trunk" = 1 ] && echo 0.0.0.0 || echo 127.0.0.1)}
+port=${VOICE_PORT:-5060}
+if is_port "$port"; then
+  ok "$host:$port"
+  # Someone already there?  (Best effort; lsof is on macOS and most Linuxes.)
+  if command -v lsof >/dev/null 2>&1 && lsof -nP -iUDP:"$port" 2>/dev/null | grep -q .; then
+    bad "UDP port $port is already in use (is a softphone or another server running on it?)"
+  fi
+else
+  bad "VOICE_PORT must be a port number"
+fi
+if is_set VOICE_MAX_CALLS && ! is_int "$VOICE_MAX_CALLS"; then
+  bad "VOICE_MAX_CALLS must be a number"
+fi
+if is_set VOICE_ALLOW; then
+  if [[ "$VOICE_ALLOW" =~ ^[0-9./,\ ]+$ ]]; then
+    ok "phones allowed from $VOICE_ALLOW"
+    case "$host" in
+      127.*|localhost) warn "VOICE_ALLOW has no effect while listening on $host; set VOICE_HOST=0.0.0.0" ;;
+    esac
+  else
+    bad "VOICE_ALLOW must be a comma-separated list such as 192.168.1.0/24"
+  fi
+fi
+
+echo
+if [ "$errors" -gt 0 ]; then
+  echo "$errors problem(s) to fix before the server can start." >&2
+  exit 1
+fi
+if [ "$check_only" = 1 ]; then
+  echo "Configuration is complete ($warnings warning(s))."
+  exit 0
+fi
+
+# --- Run -------------------------------------------------------------------
+
+echo "Starting; press Ctrl-C to stop."
 exec sbcl --noinform \
   --eval '(require :asdf)' \
   --eval '(unless (find-package :ql) (load "~/quicklisp/setup.lisp"))' \
   --eval '(push (truename ".") asdf:*central-registry*)' \
   --eval '(ql:quickload "cl-sip/voice" :silent t)' \
-  --eval '(cl-sip.voice:start-server-from-environment)' \
-  --eval '(loop (sleep 3600))'
+  --eval '(defvar cl-user::*server* (cl-sip.voice:start-server-from-environment))' \
+  --eval '(handler-case (loop (sleep 3600))
+            (sb-sys:interactive-interrupt ()
+              (format t "~&stopping...~%")
+              (cl-sip.voice:stop-server cl-user::*server*)
+              (sb-ext:exit :code 0 :abort t)))'

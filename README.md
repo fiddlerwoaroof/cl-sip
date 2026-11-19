@@ -92,8 +92,14 @@ with the macOS `say` command. The server needs `ANTHROPIC_API_KEY` in its
 environment.
 
 ```sh
-direnv exec . bin/voice-server          # listens on 127.0.0.1:5060, UDP and TCP
+bin/voice-server            # check the configuration, then run
+bin/voice-server --check    # check only
 ```
+
+The script loads the dev shell itself, reads `.envrc.local` if present,
+reports each setting as ok or as a problem (never printing values), and
+starts the server on 127.0.0.1:5060 (UDP and TCP) once everything required
+is there. Ctrl-C stops it and removes any trunk registration.
 
 or from a REPL started inside the dev shell:
 
@@ -130,7 +136,7 @@ else are dropped without an answer. To let other devices on your network
 in, listen on all interfaces and name the network:
 
 ```sh
-VOICE_HOST=0.0.0.0 VOICE_ALLOW=192.168.1.0/24 direnv exec . bin/voice-server
+VOICE_HOST=0.0.0.0 VOICE_ALLOW=192.168.1.0/24 bin/voice-server
 ```
 
 Each stage is replaceable: `start-server` takes `:stt`, `:llm` and `:tts`
@@ -146,7 +152,7 @@ and calls to your number are answered by the agent:
 export FLOWROUTE_USERNAME=...     # the tech prefix (Interconnections > Registration)
 export FLOWROUTE_PASSWORD=...     # the SIP password shown there
 export FLOWROUTE_POP=us-west-or   # or us-east-va
-direnv exec . bin/voice-server
+bin/voice-server
 ```
 
 In the Flowroute portal, route the number to "SIP registration" on the same
@@ -194,7 +200,7 @@ the model loaded; the first start downloads the model (4 GB) unless it is
 already in the Hugging Face cache.
 
 ```sh
-VOICE_TTS=chatterbox VOICE_REFERENCE=me.wav direnv exec . bin/voice-server
+VOICE_TTS=chatterbox VOICE_REFERENCE=me.wav bin/voice-server
 ```
 
 ```lisp
