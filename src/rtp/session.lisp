@@ -17,6 +17,15 @@
    (packets-sent :initform 0 :accessor rtp-session-packets-sent)
    (packets-received :initform 0 :accessor rtp-session-packets-received)
    (remote-ssrc :initform nil :accessor rtp-session-remote-ssrc)
+   (port-range :initarg :port-range :initform nil
+               :documentation "(low . high): bind to the first free port in
+this range instead of an ephemeral one, e.g. a range forwarded by a router.")
+   (stun :initarg :stun :initform nil
+         :documentation "(host . port) of a STUN server to ask, at start, for
+the socket's public address.")
+   (public-host :initform nil :accessor rtp-session-public-host
+                :documentation "Public address of the socket, when STUN found one.")
+   (public-port :initform nil :accessor rtp-session-public-port)
    (latch :initarg :latch :initform nil :accessor rtp-session-latch
           :documentation "When true, send to wherever the peer's packets actually
 come from rather than the address it advertised (symmetric RTP), which is
@@ -27,20 +36,37 @@ what makes media work through a NAT.")
    (lock :initform (bt:make-lock "rtp-send") :reader rtp-session-lock)))
 
 (defun make-rtp-session (&rest args &key local-host local-port remote-host remote-port
-                                      payload-type ssrc on-packet latch)
+                                      payload-type ssrc on-packet latch port-range stun)
   (declare (ignore local-host local-port remote-host remote-port payload-type ssrc
-                   on-packet latch))
+                   on-packet latch port-range stun))
   (apply #'make-instance 'rtp-session args))
+
+(defun rtp-session-bind (session)
+  (flet ((bind (port)
+           (usocket:socket-connect nil nil :protocol :datagram
+                                           :local-host (rtp-session-local-host session)
+                                           :local-port port)))
+    (let ((range (slot-value session 'port-range)))
+      (if range
+          (or (loop for port from (car range) to (cdr range)
+                    for socket = (ignore-errors (bind port))
+                    when socket return socket)
+              (error 'rtp-error
+                     :message (format nil "no free RTP port in ~d-~d" (car range) (cdr range))))
+          (bind (rtp-session-local-port session))))))
 
 (defun rtp-session-start (session)
   "Bind the socket (an ephemeral port when the local port is 0) and start
 receiving."
-  (let ((socket (usocket:socket-connect nil nil :protocol :datagram
-                                                :local-host (rtp-session-local-host session)
-                                                :local-port (rtp-session-local-port session))))
+  (let ((socket (rtp-session-bind session)))
     (setf (rtp-session-socket session) socket
-          (rtp-session-local-port session) (usocket:get-local-port socket)
-          (rtp-session-running session) t
+          (rtp-session-local-port session) (usocket:get-local-port socket))
+    (let ((stun (slot-value session 'stun)))
+      (when stun
+        (multiple-value-bind (host port) (stun-query socket (car stun) (cdr stun))
+          (setf (rtp-session-public-host session) host
+                (rtp-session-public-port session) port))))
+    (setf (rtp-session-running session) t
           (rtp-session-thread session)
           (bt:make-thread
            (lambda ()

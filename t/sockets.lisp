@@ -107,3 +107,67 @@
                     (rtp:rtp-session-packets-received receiver)))))
       (rtp:rtp-session-stop sender)
       (rtp:rtp-session-stop receiver))))
+
+(defun start-stun-server (reported-host reported-port)
+  "A one-socket STUN server on loopback that tells every client it appears
+as REPORTED-HOST:REPORTED-PORT.  Returns its port and a function to stop it."
+  (let* ((socket (usocket:socket-connect nil nil :protocol :datagram
+                                                 :local-host "127.0.0.1" :local-port 0))
+         (running t)
+         (thread
+           (bt:make-thread
+            (lambda ()
+              (let ((buffer (make-array 512 :element-type '(unsigned-byte 8))))
+                (loop while running
+                      do (when (usocket:wait-for-input socket :timeout 1/10 :ready-only t)
+                           (multiple-value-bind (data size host port)
+                               (usocket:socket-receive socket buffer (length buffer))
+                             (declare (ignore data))
+                             (when (and size (= size 20))
+                               (let ((reply (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 0))
+                                     (address (sip:parse-ipv4 reported-host)))
+                                 (replace reply buffer :end2 20)
+                                 (setf (aref reply 0) 1 (aref reply 1) 1 ; success response
+                                       (aref reply 3) 12
+                                       (aref reply 21) #x20 (aref reply 23) 8
+                                       (aref reply 25) 1)
+                                 (let ((xport (logxor reported-port #x2112))
+                                       (xaddr (logxor address #x2112A442)))
+                                   (setf (aref reply 26) (ldb (byte 8 8) xport)
+                                         (aref reply 27) (ldb (byte 8 0) xport))
+                                   (dotimes (i 4)
+                                     (setf (aref reply (+ 28 i))
+                                           (ldb (byte 8 (* 8 (- 3 i))) xaddr))))
+                                 (usocket:socket-send socket reply 32
+                                                      :host host :port port)))))))))))
+    (values (usocket:get-local-port socket)
+            (lambda ()
+              (setf running nil)
+              (bt:join-thread thread)
+              (usocket:socket-close socket)))))
+
+(test rtp-session-port-range-and-stun
+  (multiple-value-bind (stun-port stop-stun) (start-stun-server "203.0.113.7" 40123)
+    (let (first second)
+      (unwind-protect
+           (progn
+             (setf first (rtp:rtp-session-start
+                          (rtp:make-rtp-session :port-range '(47310 . 47312)
+                                                :stun (cons "127.0.0.1" stun-port))))
+             ;; Ports come from the range, and the next session takes the next one.
+             (is (= 47310 (rtp:rtp-session-local-port first)))
+             (is (string= "203.0.113.7" (rtp:rtp-session-public-host first)))
+             (is (= 40123 (rtp:rtp-session-public-port first)))
+             (setf second (rtp:rtp-session-start
+                           (rtp:make-rtp-session :port-range '(47310 . 47312))))
+             (is (= 47311 (rtp:rtp-session-local-port second)))
+             (is (null (rtp:rtp-session-public-host second)))
+             ;; An unreachable STUN server just leaves the address unknown.
+             (rtp:rtp-session-stop second)
+             (setf second (rtp:rtp-session-start
+                           (rtp:make-rtp-session :stun '("127.0.0.1" . 9))))
+             (is (null (rtp:rtp-session-public-host second))))
+        (when first (rtp:rtp-session-stop first))
+        (when second (rtp:rtp-session-stop second))
+        (funcall stop-stun)))))

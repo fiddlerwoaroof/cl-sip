@@ -76,3 +76,35 @@
     (is (equal '(nil nil nil nil t t t) (mapcar #'rtp:telephone-event-end events)))
     (is (every (lambda (e) (= 7 (rtp:telephone-event-event e))) events))
     (is (every (lambda (p) (= 101 (rtp:rtp-packet-payload-type p))) packets))))
+
+(test stun-binding-rfc8489
+  (let ((id (octets #xb7 #xe7 #xa7 #x01 #xbc #x34 #xd6 #x86 #xfa #x87 #xdf #xae)))
+    (is (equalp (octets 0 1 0 0 #x21 #x12 #xa4 #x42
+                        #xb7 #xe7 #xa7 #x01 #xbc #x34 #xd6 #x86 #xfa #x87 #xdf #xae)
+                (rtp:encode-stun-binding-request id)))
+    ;; RFC 5769 section 2.2: sample IPv4 response.
+    (let ((response (octets #x01 #x01 #x00 #x3c #x21 #x12 #xa4 #x42
+                            #xb7 #xe7 #xa7 #x01 #xbc #x34 #xd6 #x86 #xfa #x87 #xdf #xae
+                            #x80 #x22 #x00 #x0b
+                            #x74 #x65 #x73 #x74 #x20 #x76 #x65 #x63 #x74 #x6f #x72 #x20
+                            #x00 #x20 #x00 #x08 #x00 #x01 #xa1 #x47 #xe1 #x12 #xa6 #x43
+                            #x00 #x08 #x00 #x14
+                            #x2b #x91 #xf5 #x99 #xfd #x9e #x90 #xc3 #x8c #x74 #x89 #xf9
+                            #x2a #xf9 #xba #x53 #xf0 #x6b #xe7 #xd7
+                            #x80 #x28 #x00 #x04 #xc0 #x7d #x4c #x96)))
+      (is (equal '("192.0.2.1" 32853)
+                 (multiple-value-list (rtp:decode-stun-binding-response response id))))
+      ;; Another transaction's response, a request, and a truncated packet
+      ;; are all rejected.
+      (is (null (rtp:decode-stun-binding-response
+                 response (octets 0 0 0 0 0 0 0 0 0 0 0 0))))
+      (is (null (rtp:decode-stun-binding-response (rtp:encode-stun-binding-request id) id)))
+      (is (null (rtp:decode-stun-binding-response response id :end 40))))
+    ;; The older MAPPED-ADDRESS attribute is accepted as a fallback.
+    (is (equal '("203.0.113.9" 4660)
+               (multiple-value-list
+                (rtp:decode-stun-binding-response
+                 (octets #x01 #x01 #x00 #x0c #x21 #x12 #xa4 #x42
+                         #xb7 #xe7 #xa7 #x01 #xbc #x34 #xd6 #x86 #xfa #x87 #xdf #xae
+                         #x00 #x01 #x00 #x08 #x00 #x01 #x12 #x34 203 0 113 9)
+                 id))))))

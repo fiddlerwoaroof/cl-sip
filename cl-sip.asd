@@ -31,7 +31,7 @@
       :components ((:file "sdp") (:file "offer-answer")))
      (:module "rtp"
       :serial t
-      :components ((:file "packet") (:file "g711") (:file "dtmf") (:file "session"))))))
+      :components ((:file "packet") (:file "g711") (:file "dtmf") (:file "stun") (:file "session"))))))
   :in-order-to ((test-op (test-op "cl-sip/test"))))
 
 (defsystem "cl-sip/voice"

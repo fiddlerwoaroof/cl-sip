@@ -20,6 +20,8 @@
    #:rtp-session-local-port #:rtp-session-remote-host #:rtp-session-remote-port
    #:rtp-session-ssrc #:rtp-session-payload-type #:rtp-session-on-packet
    #:rtp-session-packets-sent #:rtp-session-packets-received
+   #:rtp-session-public-host #:rtp-session-public-port
+   #:encode-stun-binding-request #:decode-stun-binding-response #:stun-query
    #:rtp-session-remote-ssrc #:rtp-session-latch #:rtp-send #:rtp-skip #:rtp-send-dtmf))
 
 (in-package :cl-sip.rtp)
