@@ -396,8 +396,23 @@ what it asks for, and pass a hold or resume on to the other party."
     (:reinvite-rejected
      (bridge-log bridge "a phone refused a change to the call (~a)" status))))
 
-(defun bridge-fork-event (bridge leg event &rest args &key sdp status cause
+(defun bridge-log-refusal (bridge leg status response)
+  "Say what a phone or the provider answered when it did not take the call."
+  (when (and status (>= status 300))
+    (bridge-log bridge "~a answered ~d ~a~@[ (~a)~]"
+                (let ((target (leg-target leg)))
+                  (if (getf target :uri)
+                      (sip:uri-string (sip:ensure-uri (getf target :uri)))
+                      (leg-label leg)))
+                status
+                (or (and response (sip:response-reason response))
+                    (sip:reason-phrase status))
+                (and response (sip:header response "Reason")))))
+
+(defun bridge-fork-event (bridge leg event &rest args &key sdp status cause response
                           &allow-other-keys)
+  (when (eq event :terminated)
+    (ignore-errors (bridge-log-refusal bridge leg status response)))
   (case event
     (:ringing (bridge-ring bridge))
     (:progress (if sdp
