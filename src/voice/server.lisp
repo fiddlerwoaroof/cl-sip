@@ -341,12 +341,29 @@ with the agent once it has started."
                     (sip:schedule (sip:ua-scheduler ua) 60
                                   (lambda () (sip:refresh-registration registration))))))))))))
 
+(defun server-trace (server direction message host port)
+  "Write a SIP message to the log, without the credentials in it."
+  (ignore-errors
+   (let ((text (sip:message-string message)))
+     (server-log server "~:[<-- from~;--> to~] ~a:~a~%~{    ~a~%~}"
+                 (eq direction :out) host port
+                 (mapcar (lambda (line)
+                           (let ((line (string-right-trim '(#\Return) line)))
+                             (if (or (alexandria:starts-with-subseq "Authorization:" line
+                                                                    :test #'char-equal)
+                                     (alexandria:starts-with-subseq "Proxy-Authorization:" line
+                                                                    :test #'char-equal))
+                                 (concatenate 'string (subseq line 0 (position #\: line))
+                                              ": (credentials not shown)")
+                                 line)))
+                         (uiop:split-string text :separator '(#\Newline)))))))
+
 (defun start-server (&key (host "127.0.0.1") (port 5060) users
                        (dialplan *default-dialplan*)
                        (stt (make-whisper-stt)) (llm (make-claude-llm)) (tts (make-say-tts))
                        (greeting "Hello! What can I do for you?")
                        (barge-in t) (tcp t) (log-stream *standard-output*)
-                       trunk allow allowed-callers (max-calls 2) rtp-port-range stun
+                       trunk allow allowed-callers (max-calls 2) rtp-port-range stun trace
                        extensions (ring-seconds 30) outbound-caller-id)
   "Start a phone server on HOST:PORT (UDP, and TCP unless TCP is NIL).
 
@@ -429,6 +446,12 @@ a STUN server (\"host:port\")."
           (lambda (user contacts)
             (server-log server "phone ~a: ~:[no longer registered~;registered at ~:*~{~a~^, ~}~]"
                         user contacts)))
+    (when trace
+      (setf (sip:stack-trace-function (sip:ua-stack ua))
+            (lambda (direction message remote-host remote-port)
+              (when (or (eq trace :all)
+                        (not (sip:cidr-match-p remote-host "127.0.0.0/8")))
+                (server-trace server direction message remote-host remote-port)))))
     (sip:start ua)
     (server-log server "listening on ~a:~d" host (server-port server))
     (if extensions
@@ -530,6 +553,8 @@ said (names and snippets only; read a page before relying on it):"))
                                 when there is one)
   VOICE_RING_SECONDS            how long an extension rings (30)
   VOICE_GREETING                what the agent says when it answers
+  VOICE_SIP_TRACE               trunk: log the SIP messages exchanged with the
+                                provider; all: those with the phones as well
   VOICE_OUTBOUND_CALLER_ID      your number at the provider; setting it lets
                                 extensions marked :outbound dial out
   VOICE_WIKI_TOKEN              capability token for the LLM-wiki MCP server;
@@ -550,6 +575,8 @@ OVERRIDES are START-SERVER keyword arguments that take precedence."
            (append
             overrides
             (and (env "VOICE_GREETING") (list :greeting (env "VOICE_GREETING")))
+            (and (env "VOICE_SIP_TRACE")
+                 (list :trace (if (string-equal (env "VOICE_SIP_TRACE") "all") :all :trunk)))
             (list :host (or (env "VOICE_HOST") (if trunk "0.0.0.0" "127.0.0.1"))
                   :port (parse-integer (or (env "VOICE_PORT") "5060"))
                   :allow (env-list "VOICE_ALLOW")

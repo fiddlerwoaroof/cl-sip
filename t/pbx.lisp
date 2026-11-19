@@ -1204,3 +1204,14 @@ returns is pushed with RESULTS."
         (is-true (wait-for-call (desk-call callee) :terminated))
         (is-true (sip:wait-until (lambda () (zerop (voice::server-active-calls server)))))
         (is (null (voice::server-bridges server)))))))
+
+(test sip-trace-leaves-out-credentials
+  (let* ((log (make-string-output-stream))
+         (server (start-pbx :log-stream log :trace :all)))
+    (with-phones (server (alice "100" "alice-pw"))
+      (is (eq :registered (register-phone alice server)))
+      (let ((text (get-output-stream-string log)))
+        (is (search "REGISTER sip:" text))
+        (is (search "SIP/2.0 401" text))
+        (is (search "Authorization: (credentials not shown)" text))
+        (is (null (search "response=" text)))))))
