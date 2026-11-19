@@ -706,6 +706,94 @@ as a session description arrives."
         (settle world)
         (is (equal '("REFER" "400/REFER") (wire world)))))))
 
+;;; Dialling out, against a stand-in for the provider
+
+(defmacro with-provider ((provider port) &body body)
+  "A stand-in SIP provider on loopback that accepts the server's
+registration."
+  `(let* ((,provider (sip:make-user-agent
+                      :aor "sip:provider@127.0.0.1"
+                      :transports '((:udp :host "127.0.0.1" :port 0))
+                      :registrar (sip:make-registrar :realm "provider"
+                                                     :users '(("12345678" . "secret")))))
+          (,port (progn (sip:start ,provider)
+                        (sip:transport-port
+                         (first (sip:stack-transports (sip:ua-stack ,provider)))))))
+     (unwind-protect (progn ,@body)
+       (sip:stop ,provider))))
+
+(defun trunk-settings (port)
+  ;; Everything here lives on 127.0.0.1, so the provider is told apart from
+  ;; the phones by its port.
+  (list :registrar (format nil "sip:127.0.0.1:~d" port)
+        :username "12345678" :password "secret"
+        :ranges (list (format nil "127.0.0.1:~d" port))))
+
+(defparameter *outbound-extensions*
+  '(("100" :password "alice-pw" :name "Alice" :outbound t)
+    ("101" :password "bob-pw" :name "Bob")
+    ("102" :password "carol-pw" :name "Carol" :outbound t :forward "206-555-0188")))
+
+(test dialling-out-through-the-trunk
+  (with-provider (provider port)
+    (with-pbx (server (start-pbx :extensions *outbound-extensions*
+                                 :trunk (trunk-settings port)
+                                 :outbound-caller-id "+1 206 555 0100"
+                                 :dialplan '((:default (:reject 404))))
+                      (alice "100" "alice-pw") (bob "101" "bob-pw"))
+      (let ((network (attend provider :after 1/4 :early t))
+            (caller (open-desk alice)))
+        ;; Alice may dial out.  The provider gets the number in full, from
+        ;; the server's own number, under her name.
+        (let ((call (dial caller server "206-555-0123")))
+          (is-true (wait-for-call call :established))
+          (let ((invite (sip:call-invite (desk-call network))))
+            (is (string= "12065550123" (sip:sip-uri-user (sip:request-uri invite))))
+            (is (string= "12065550100"
+                         (sip:sip-uri-user (sip:name-addr-uri (sip:msg-from invite)))))
+            (is (string= "Alice" (sip:name-addr-display-name (sip:msg-from invite)))))
+          (is-true (wait-for-call (desk-call network) :established))
+          (say caller 5)
+          (is-true (hears network 5))
+          (say network 5)
+          (is-true (hears caller 5))
+          (sip:hangup call)
+          (is-true (wait-for-call (desk-call network) :terminated)))
+        ;; Bob may not.
+        (let ((call (dial (open-desk bob) server "12065550123")))
+          (is-true (wait-for-call call :terminated))
+          (is (= 403 (sip:call-status call))))
+        (is (= 1 (length (desk-calls network))))
+        ;; Carol's calls are forwarded to her mobile, on her authority, even
+        ;; when the caller could not dial out himself.
+        (let ((call (dial (open-desk bob) server "102")))
+          (is-true (wait-for-call call :established))
+          (is (= 2 (length (desk-calls network))))
+          (is (string= "12065550188"
+                       (sip:sip-uri-user
+                        (sip:request-uri (sip:call-invite (desk-call network))))))
+          (sip:hangup call)
+          (is-true (wait-for-call call :terminated)))
+        ;; A call from outside to an outside number is not sent back out.
+        (let ((call (sip:invite provider (pbx-uri server "12345678")
+                                :to "<sip:+12065550177@127.0.0.1>"
+                                :sdp (sdp:sdp-string (sdp:make-audio-offer :port 40000)))))
+          (is-true (wait-for-call call :terminated))
+          (is (= 403 (sip:call-status call)))
+          (is (= 2 (length (desk-calls network)))))))))
+
+(test no-dialling-out-unless-configured
+  ;; Without a caller ID the same number is just another dialplan entry.
+  (with-pbx (server (start-pbx :extensions *outbound-extensions*
+                               :dialplan '((:default (:reject 404))))
+                    (alice "100" "alice-pw"))
+    (let ((call (dial (open-desk alice) server "2065550123")))
+      (is-true (wait-for-call call :terminated))
+      (is (= 404 (sip:call-status call)))))
+  (is (voice::range-match-p "127.0.0.1" 5080 "127.0.0.1:5080"))
+  (is (not (voice::range-match-p "127.0.0.1" 5081 "127.0.0.1:5080")))
+  (is (voice::range-match-p "34.210.91.115" 5060 "34.210.91.112/28")))
+
 (defun audio-direction (sdp-text)
   (let ((session (sdp:parse-sdp sdp-text)))
     (sdp:media-direction (first (sdp:session-media session)) session)))

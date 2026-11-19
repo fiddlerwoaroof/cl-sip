@@ -20,6 +20,8 @@
 #     VOICE_STUN               or a STUN server, host:port
 #     VOICE_ALLOWED_CALLERS    comma-separated numbers the agent will answer
 #     VOICE_MAX_CALLS          agent calls at once (default 2)
+#     VOICE_OUTBOUND_CALLER_ID one of your Flowroute numbers; with it, extensions
+#                              marked :outbound can dial telephone numbers
 #
 #   Optional
 #     VOICE_HOST, VOICE_PORT   listen address (127.0.0.1, or 0.0.0.0 with a
@@ -179,6 +181,18 @@ fi
 if is_set VOICE_STUN; then
   if [[ "$VOICE_STUN" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then ok "STUN server $VOICE_STUN"
   else bad "VOICE_STUN must look like host:port"; fi
+fi
+if is_set VOICE_OUTBOUND_CALLER_ID; then
+  caller_id_digits=${VOICE_OUTBOUND_CALLER_ID//[^0-9]/}
+  if [ "$trunk" != 1 ]; then
+    bad "VOICE_OUTBOUND_CALLER_ID needs the Flowroute credentials too"
+  elif [ ${#caller_id_digits} -lt 10 ]; then
+    bad "VOICE_OUTBOUND_CALLER_ID must be a full telephone number"
+  else
+    ok "extensions marked :outbound can dial out (calls cost money)"
+  fi
+elif [ "$trunk" = 1 ]; then
+  note "no VOICE_OUTBOUND_CALLER_ID: nobody can dial out"
 fi
 if [ "$trunk" = 1 ]; then
   if ! is_set VOICE_RTP_PORTS && ! is_set VOICE_STUN; then

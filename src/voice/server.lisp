@@ -37,6 +37,16 @@ their calls.")
    (ring-seconds :initarg :ring-seconds :initform 30 :accessor server-ring-seconds
                  :documentation "How long an extension rings before the call counts
 as unanswered.")
+   (trunk :initarg :trunk :initform nil :accessor server-trunk
+          :documentation "The trunk's settings, as given to START-SERVER.")
+   (outbound-caller-id :initarg :outbound-caller-id :initform nil
+                       :accessor server-outbound-caller-id
+                       :documentation "The number shown on calls placed through the
+trunk.  Without it nobody can dial out.")
+   (outbound-patterns :initarg :outbound-patterns
+                      :initform '("1XXXXXXXXXX" "XXXXXXXXXX")
+                      :accessor server-outbound-patterns
+                      :documentation "Dialled numbers that go out through the trunk.")
    (bridges :initform '() :accessor server-bridges
             :documentation "Bridged calls in progress (see bridge.lisp).")
    (max-calls :initarg :max-calls :initform 2 :accessor server-max-calls
@@ -93,6 +103,11 @@ an extension or group of that number, then the dialplan's default."
   (or (dialplan-action (remove :default (server-dialplan server) :key #'first) dialled)
       (let ((extension (find-extension (server-extensions server) dialled)))
         (and extension (list :extension extension)))
+      (and (server-outbound-caller-id server)
+           (server-trunk server)
+           (some (lambda (pattern) (extension-matches-p pattern dialled))
+                 (server-outbound-patterns server))
+           :trunk)
       (dialplan-action (server-dialplan server) dialled)))
 
 ;;; Who is calling
@@ -100,9 +115,20 @@ an extension or group of that number, then the dialplan's default."
 (defun server-transport (server)
   (first (sip:stack-transports (sip:ua-stack (server-ua server)))))
 
-(defun server-source-kind (server host)
+(defun range-match-p (host port range)
+  "RANGE is a network in CIDR form, or one endpoint as \"address:port\"
+(a provider reached through a fixed port, or a stand-in for one)."
+  (let ((colon (position #\: range)))
+    (if colon
+        (and port
+             (string= host (subseq range 0 colon))
+             (eql port (parse-integer range :start (1+ colon) :junk-allowed t)))
+        (sip:cidr-match-p host range))))
+
+(defun server-source-kind (server host &optional port)
   "How a request from HOST is treated: :TRUNK, :LOCAL, or NIL (ignored)."
-  (cond ((some (lambda (cidr) (sip:cidr-match-p host cidr)) (server-trunk-ranges server))
+  (cond ((some (lambda (range) (range-match-p host port range))
+               (server-trunk-ranges server))
          :trunk)
         ((or (sip:cidr-match-p host "127.0.0.0/8")
              (equal host (sip:transport-advertised-host (server-transport server)))
@@ -113,7 +139,7 @@ an extension or group of that number, then the dialplan's default."
   "Request filter: anything not from the trunk or an allowed phone is dropped
 without an answer, so scanners learn nothing."
   (let ((host (sip:message-remote-host request)))
-    (or (and (server-source-kind server host) t)
+    (or (and (server-source-kind server host (sip:message-remote-port request)) t)
         (progn
           (unless (member host (server-dropped server) :test #'equal)
             (when (< (length (server-dropped server)) 100)
@@ -138,7 +164,8 @@ without an answer, so scanners learn nothing."
   (or (and (sip:sip-uri-p uri) (sip:sip-uri-user uri)) ""))
 
 (defun call-kind (server call)
-  (server-source-kind server (sip:message-remote-host (sip:call-invite call))))
+  (server-source-kind server (sip:message-remote-host (sip:call-invite call))
+                      (sip:message-remote-port (sip:call-invite call))))
 
 (defun call-extension (server call)
   "What was dialled.  A phone puts it in the Request-URI.  A trunk delivers
@@ -310,6 +337,8 @@ NIL after rejecting the call."
       ((functionp action) (funcall action server call extension))
       ((and (consp action) (eq (first action) :extension))
        (server-call-extension server call (second action)))
+      ((eq action :trunk)
+       (server-call-trunk server call extension))
       ((and (consp action) (eq (first action) :reject))
        (sip:reject call (or (second action) 486)))
       (t
@@ -365,12 +394,15 @@ NIL after rejecting the call."
                        (greeting "Hello! What can I do for you?")
                        (barge-in t) (tcp t) (log-stream *standard-output*)
                        trunk allow allowed-callers (max-calls 2) rtp-port-range stun
-                       extensions (ring-seconds 30))
+                       extensions (ring-seconds 30) outbound-caller-id)
   "Start a phone server on HOST:PORT (UDP, and TCP unless TCP is NIL).
 
 Softphones may register with any user name; with USERS, an alist of
 (name . password), registration requires digest authentication.  Calls are
 routed by DIALPLAN (see *DEFAULT-DIALPLAN*).
+
+OUTBOUND-CALLER-ID, one of your numbers at the provider, lets extensions
+marked :OUTBOUND dial telephone numbers through the trunk.
 
 EXTENSIONS is the extension list, as forms (see PARSE-EXTENSION) or as
 LOAD-EXTENSIONS returns it.  With one, only those extensions may register,
@@ -417,6 +449,9 @@ a STUN server (\"host:port\")."
                                                    (getf trunk :ranges
                                                          *flowroute-signalling-ranges*))
                                 :extensions extensions :ring-seconds ring-seconds
+                                :trunk trunk
+                                :outbound-caller-id (and outbound-caller-id
+                                                         (normalize-number outbound-caller-id))
                                 :allow allow :allowed-callers allowed-callers
                                 :max-calls max-calls :rtp-port-range rtp-port-range
                                 :stun (etypecase stun
@@ -531,6 +566,8 @@ said (names and snippets only; read a page before relying on it):"))
   VOICE_EXTENSIONS              file with the extension list (extensions.lisp
                                 when there is one)
   VOICE_RING_SECONDS            how long an extension rings (30)
+  VOICE_OUTBOUND_CALLER_ID      your number at the provider; setting it lets
+                                extensions marked :outbound dial out
   VOICE_WIKI_TOKEN              capability token for the LLM-wiki MCP server;
                                 setting it lets the agent consult the wiki
   VOICE_WIKI_URL                where that server is (http://localhost:8788/mcp)
@@ -563,6 +600,7 @@ OVERRIDES are START-SERVER keyword arguments that take precedence."
                                                    "extensions.lisp"))))
                                 (and path (load-extensions path)))
                   :ring-seconds (parse-integer (or (env "VOICE_RING_SECONDS") "30"))
+                  :outbound-caller-id (env "VOICE_OUTBOUND_CALLER_ID")
                   :llm (make-claude-llm
                         ;; Room for a few whole pages, and for a second search.
                         :max-tool-result 40000 :max-tool-rounds 6

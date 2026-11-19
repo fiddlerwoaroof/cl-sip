@@ -28,6 +28,8 @@
    (told-held :initform nil :accessor leg-told-held
               :documentation "True while this leg has been offered sendonly because
 the other party is holding.")
+   (extension :initarg :extension :initform nil :accessor leg-extension
+              :documentation "The extension at the far end, when it is one.")
    (party :initarg :party :initform nil :accessor leg-party
           :documentation "Who is at the far end, as a name-addr the server vouches for.")))
 
@@ -423,12 +425,14 @@ it is not touched, and ON-ANSWERED is called with the leg that answers."
         (ua (server-ua server)))
     (push bridge (server-bridges server))
     (unless established
-      (setf (leg-party a) from)
+      (setf (leg-party a) from
+            (leg-extension a) (call-caller-extension (leg-call a)))
       (bridge-take-leg bridge a))
     (dolist (target targets)
       (let ((leg (server-open-leg server :trunk (getf target :trunk) :target target)))
         (push leg (bridge-forks bridge))
-        (setf (leg-party leg) (getf target :to))
+        (setf (leg-party leg) (getf target :to)
+              (leg-extension leg) (getf target :extension))
         (setf (leg-call leg)
               (sip:invite ua (getf target :uri)
                           :auto-answer-reinvite nil
@@ -560,6 +564,27 @@ statuses (RFC 3515): the last report is final."
                                            (progn (sip:hangup (leg-call new))
                                                   (leg-close new)))))
                        (bridge-pending bridge))))))
+           ((eq action :trunk)
+            (cond
+              ((not (and (leg-extension leg) (extension-outbound (leg-extension leg))))
+               (funcall notify 403 t))
+              (t
+               (push (bridge-call
+                      server keep (list (server-trunk-target server number))
+                      :from (server-trunk-identity server (leg-extension leg))
+                      :label (format nil "transfer to ~a" number)
+                      :ring-seconds *outbound-ring-seconds*
+                      :established t
+                      :on-failed (lambda (status reason)
+                                   (declare (ignore reason))
+                                   (funcall notify status t))
+                      :on-answered (lambda (new)
+                                     (funcall notify 200 t)
+                                     (if (eq (bridge-state bridge) :connected)
+                                         (bridge-replace-leg bridge leg new)
+                                         (progn (sip:hangup (leg-call new))
+                                                (leg-close new)))))
+                     (bridge-pending bridge)))))
            ((or (eq action :agent) (eq action :echo)
                 (and (consp action) (member (first action) '(:say :play))))
             ;; Handed to the server itself: the agent, or an announcement.
@@ -711,15 +736,20 @@ once if it already is (a call transferred to the agent)."
         (when (leg-told-held a)
           (leg-reoffer a nil))))))
 
-(defun server-deliver (server a number route)
+(defun server-deliver (server a number route &optional on-behalf-of)
   "Send the incoming call on leg A to NUMBER, wherever the dialplan and the
-extension list say that is."
+extension list say that is.  ON-BEHALF-OF is the extension whose forwarding
+sent it there."
   (let ((action (server-route server number)))
     (cond
       ((> (route-forwards route) *max-forwards*)
        (server-log server "  forwarded too many times; giving up")
        (sip:reject (leg-call a) 482)
        (leg-close a))
+      ((eq action :trunk)
+       ;; Forwarding to an outside number spends the forwarding extension's
+       ;; right to dial out, not the caller's.
+       (server-ring-trunk server a number on-behalf-of))
       ((and (consp action) (eq (first action) :extension))
        (server-ring-extension server a (second action) route))
       (t (server-answer-with server a action)))))
@@ -731,8 +761,10 @@ extension list say that is."
   (cond ((eq target :agent)
          (server-answer-with server a :agent))
         (t
-         (server-deliver server a target
-                         (route-retarget route server target cause)))))
+         (let ((number (normalize-number target)))
+           (server-deliver server a number
+                           (route-retarget route server number cause)
+                           extension)))))
 
 (defun server-ring-extension (server a extension &optional
                                                    (route (route-start
@@ -780,5 +812,61 @@ the extension's forwarding says (RFC 5359 sections 2.7 to 2.9)."
            (server-ring-extension server a extension))
           (t
            ;; No offer, or no audio in it that we can relay.
+           (leg-close a)
+           (sip:reject call 488)))))
+
+;;; Calls out through the trunk
+
+(defparameter *outbound-ring-seconds* 60
+  "How long a call placed through the trunk may ring.  The telephone
+network gives up by itself; this is the backstop.")
+
+(defun e164-number (number)
+  "NUMBER as the provider wants it: eleven digits for North America."
+  (if (= (length number) 10)
+      (concatenate 'string "1" number)
+      number))
+
+(defun server-trunk-uri (server number)
+  (let ((registrar (sip:ensure-uri (getf (server-trunk server) :registrar))))
+    (sip:make-sip-uri :user (e164-number number)
+                      :host (sip:sip-uri-host registrar)
+                      :port (sip:sip-uri-port registrar))))
+
+(defun server-trunk-target (server number)
+  (let ((uri (server-trunk-uri server number)))
+    (list :uri uri :to (sip:make-name-addr :uri uri) :trunk t)))
+
+(defun server-trunk-identity (server &optional extension)
+  "Who a call through the trunk is from: the server's number there, since a
+provider only carries calls from numbers it knows, under the caller's name."
+  (sip:make-name-addr
+   :display-name (and extension (extension-name extension))
+   :uri (server-trunk-uri server (server-outbound-caller-id server))))
+
+(defun server-ring-trunk (server a number extension)
+  "Place the incoming call on leg A to the outside NUMBER, on the authority
+of EXTENSION, which must be allowed to dial out.  Calls that came in from
+the trunk never go back out by themselves: that is how toll fraud works."
+  (let ((call (leg-call a)))
+    (cond
+      ((not (and extension (extension-outbound extension)))
+       (server-log server "  ~a may not dial out"
+                   (if extension (extension-label extension) "the caller"))
+       (sip:reject call 403)
+       (leg-close a))
+      (t
+       (bridge-call server a (list (server-trunk-target server number))
+                    :from (server-trunk-identity server extension)
+                    :label (format nil "~a -> ~a" (extension-label extension)
+                                   (e164-number number))
+                    :ring-seconds *outbound-ring-seconds*)))))
+
+(defun server-call-trunk (server call number)
+  "Dialplan action for a telephone number dialled by a phone."
+  (let ((a (server-open-leg server :call call :trunk (eq (call-kind server call) :trunk))))
+    (cond ((leg-answer-offer server a (sip:call-remote-sdp call))
+           (server-ring-trunk server a number (call-caller-extension call)))
+          (t
            (leg-close a)
            (sip:reject call 488)))))

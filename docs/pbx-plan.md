@@ -141,6 +141,12 @@ as the voice tests do. No phase needs a real softphone or the real trunk.
   media address.
 - Off unless `VOICE_OUTBOUND_CALLER_ID` is set; only extensions with
   `:outbound t` may use it; early media from the carrier is relayed (phase 2).
+- A call that came in from the trunk is never sent back out on the caller's
+  say-so. Forwarding or transferring to an outside number uses the right of
+  the extension that forwards or transfers.
+- To check against the real provider: the number format (eleven digits is
+  assumed), that credentials rather than the source address authorise
+  outbound calls, and what caller ID Flowroute accepts in From.
 
 ### Phase 7 — Events (RFC 6665, 4235)
 
@@ -168,5 +174,5 @@ Updated as phases land.
 | 3 Changes during a call | done |
 | 4 Forwarding | done |
 | 5 Transfer | done, except INVITE with Replaces |
-| 6 Dialling out | planned |
+| 6 Dialling out | done in simulation; not yet tried against Flowroute |
 | 7 Events | planned |

@@ -234,7 +234,22 @@ remain are joined and the phone that transferred is released, or, if the
 target does not answer, the original call carries on. Calls can be
 transferred to the agent like any other number.
 
-The design and what is still to come (dialling out, busy lamps) are in
+To let phones call telephone numbers through the trunk, set
+`VOICE_OUTBOUND_CALLER_ID` to one of your Flowroute numbers and mark the
+extensions that may do so:
+
+```lisp
+("100" :password "s3cret" :name "Alice" :outbound t)
+```
+
+Ten- and eleven-digit numbers dialled from such a phone then go to the
+provider, shown as coming from that number. Without the setting nobody can
+dial out, and a call that arrived from the trunk is never sent back out. A
+forwarding target may be an outside number if the forwarding extension is
+marked `:outbound`. This has been exercised against a stand-in provider
+only, not yet against Flowroute itself.
+
+The design and what is still to come (busy lamps) are in
 `docs/pbx-plan.md`.
 
 ### Looking things up in the wiki
