@@ -25,6 +25,10 @@ NIL matches any realm.")
                      :accessor ua-on-incoming-call
                      :documentation "(lambda (call)) called for each new INVITE.")
    (registrar :initarg :registrar :initform nil :accessor ua-registrar)
+   (request-filter :initarg :request-filter :initform nil :accessor ua-request-filter
+                   :documentation "(lambda (request)) consulted before anything
+else for each new request: true accepts it, a status code refuses it with that
+response, NIL drops it without answering.")
    (media :initarg :media :initform nil :accessor ua-media
           :documentation "Free for the application (e.g. SDP capabilities).")))
 
@@ -37,7 +41,7 @@ NIL matches any realm.")
 
 (defun make-user-agent (&key aor display-name credentials outbound-proxy
                           transports scheduler stack on-incoming-call registrar
-                          (user-agent-name "cl-sip/0.1") trace)
+                          request-filter (user-agent-name "cl-sip/0.1") trace)
   "Create a user agent.  AOR is the address-of-record (string or URI).
 TRANSPORTS is a list of transport objects or specs such as
 (:udp :host \"0.0.0.0\" :port 5060).  SCHEDULER lets several agents share one
@@ -54,6 +58,7 @@ event loop (the tests use a virtual one)."
                             :outbound-proxy (and outbound-proxy (ensure-uri outbound-proxy))
                             :on-incoming-call on-incoming-call
                             :registrar registrar
+                            :request-filter request-filter
                             :user-agent-name user-agent-name)))
     (dolist (spec transports)
       (add-transport stack (make-transport-from-spec spec)))
@@ -84,27 +89,34 @@ loop thread."
     (mapc #'transport-stop (stack-transports stack)))
   ua)
 
-(defun ua-contact (ua &optional transport)
-  "Contact NAME-ADDR for this agent on TRANSPORT (default: the first)."
+(defun ua-contact (ua &optional transport external)
+  "Contact NAME-ADDR for this agent on TRANSPORT (default: the first).  With
+EXTERNAL, the transport's public address is used when one is known."
   (let* ((transport (or transport (first (stack-transports (ua-stack ua)))))
-         (aor (name-addr-uri (ua-aor ua))))
+         (aor (name-addr-uri (ua-aor ua)))
+         (public (and external (transport-public-host transport))))
     (make-name-addr
      :uri (make-sip-uri :user (and (sip-uri-p aor) (sip-uri-user aor))
-                        :host (transport-advertised-host transport)
-                        :port (transport-port transport)
+                        :host (or public (transport-advertised-host transport))
+                        :port (or (and public (transport-public-port transport))
+                                  (transport-port transport))
                         :params (unless (string= (transport-protocol transport) "UDP")
                                   (list (cons "transport"
                                               (string-downcase
                                                (transport-protocol transport)))))))))
 
 (defun ua-contact-for (ua request)
-  "Contact matching the transport REQUEST will use or arrived on."
-  (ua-contact ua
-              (or (message-transport request)
-                  (ignore-errors
-                   (stack-find-transport
-                    (ua-stack ua)
-                    (nth-value 2 (uri-destination (next-hop-uri request))))))))
+  "Contact matching the transport REQUEST will use or arrived on.  A peer on
+the public side of a NAT is given the transport's public address."
+  (if (message-transport request)
+      (ua-contact ua (message-transport request)
+                  (not (private-address-p (message-remote-host request))))
+      (multiple-value-bind (host port protocol)
+          (ignore-errors (uri-destination (next-hop-uri request)))
+        (declare (ignore port))
+        (ua-contact ua
+                    (ignore-errors (stack-find-transport (ua-stack ua) protocol))
+                    (and host (not (private-address-p host)))))))
 
 ;;;; Building requests outside a dialog (section 8.1.1)
 
@@ -272,6 +284,16 @@ transaction's From tag, Call-ID and CSeq, but arrived by another path."
            nil))))
 
 (defun ua-handle-request (ua request tx)
+  (let ((verdict (or (null (ua-request-filter ua))
+                     (funcall (ua-request-filter ua) request))))
+    (cond ((null verdict)
+           ;; Unwanted source: say nothing, and forget the transaction.
+           (tx-terminate tx))
+          ((integerp verdict)
+           (ua-respond ua tx request verdict))
+          (t (ua-dispatch-request ua request tx)))))
+
+(defun ua-dispatch-request (ua request tx)
   (let ((method (request-method request)))
     (cond
       ((string= method "CANCEL")

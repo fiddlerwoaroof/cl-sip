@@ -9,6 +9,8 @@
    (log :initform '() :accessor network-log
         :documentation "Every message sent, newest first, as
 (message from-host from-port to-host to-port).")
+   (keepalives :initform 0 :accessor network-keepalives
+               :documentation "Count of non-SIP datagrams sent (keep-alives).")
    (filter :initarg :filter :initform nil :accessor network-filter
            :documentation "(lambda (message from-host to-host)) returning
 :DROP to lose the message, an integer N to deliver N copies, or anything else
@@ -19,11 +21,14 @@ to deliver it once.")))
 
 (defclass memory-transport (transport)
   ((network :initarg :network :reader transport-network)
-   (reliable :initarg :reliable :initform nil)))
+   (reliable :initarg :reliable :initform nil)
+   (nat :initarg :nat :initform nil :reader transport-nat
+        :documentation "(host . port) this endpoint appears as to its peers,
+simulating a NAT; it is also reachable at that address.")))
 
-(defun make-memory-transport (network host &key (port 5060) reliable)
+(defun make-memory-transport (network host &key (port 5060) reliable nat)
   (make-instance 'memory-transport :network network :host host :port port
-                                   :reliable reliable))
+                                   :reliable reliable :nat nat))
 
 (defmethod transport-protocol ((transport memory-transport))
   (if (slot-value transport 'reliable) "TCP" "UDP"))
@@ -35,9 +40,14 @@ to deliver it once.")))
   (format nil "~a:~d" (string-downcase host) port))
 
 (defmethod transport-start ((transport memory-transport))
-  (setf (gethash (endpoint-key (transport-host transport) (transport-port transport))
-                 (network-endpoints (transport-network transport)))
-        transport))
+  (let ((endpoints (network-endpoints (transport-network transport)))
+        (nat (transport-nat transport)))
+    (setf (gethash (endpoint-key (transport-host transport) (transport-port transport))
+                   endpoints)
+          transport)
+    (when nat
+      (setf (gethash (endpoint-key (car nat) (cdr nat)) endpoints) transport))
+    transport))
 
 (defmethod transport-stop ((transport memory-transport))
   (remhash (endpoint-key (transport-host transport) (transport-port transport))
@@ -47,21 +57,26 @@ to deliver it once.")))
 (defmethod transport-send ((transport memory-transport) octets host port connection)
   (declare (ignore connection))
   (let* ((network (transport-network transport))
-         (message (parse-message octets))
-         (verdict (and (network-filter network)
+         (message (handler-case (parse-message octets)
+                    (sip-parse-error () nil)))   ; keep-alives are not messages
+         (verdict (and message (network-filter network)
                        (funcall (network-filter network) message
                                 (transport-host transport) host)))
          (peer (gethash (endpoint-key host port) (network-endpoints network))))
-    (push (list message (transport-host transport) (transport-port transport) host port)
-          (network-log network))
+    (if message
+        (push (list message (transport-host transport) (transport-port transport) host port)
+              (network-log network))
+        (incf (network-keepalives network)))
     (cond ((eq verdict :drop))
           ((null peer)
            (when (transport-reliable-p transport)
              (error 'transport-error :cause (format nil "no route to ~a:~d" host port))))
           (t
-           (dotimes (i (if (integerp verdict) verdict 1))
-             (transport-receive peer octets (transport-host transport)
-                                (transport-port transport)))))))
+           (let ((nat (transport-nat transport)))
+             (dotimes (i (if (integerp verdict) verdict 1))
+               (transport-receive peer octets
+                                  (if nat (car nat) (transport-host transport))
+                                  (if nat (cdr nat) (transport-port transport)))))))))
 
 (defun network-messages (network)
   "Messages sent so far, oldest first."

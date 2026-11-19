@@ -207,6 +207,32 @@ parameter is present (it may be present without a value)."
     (string (string-to-octets thing))
     (vector (coerce thing 'octets))))
 
+;;;; IPv4 addresses
+
+(defun parse-ipv4 (string)
+  "The address in dotted-quad STRING as an integer, or NIL."
+  (let ((parts (split-top-level (string-trim "[]" string) #\.)))
+    (and (= (length parts) 4)
+         (every (lambda (p) (and (all-digits-p p) (<= (length p) 3) (<= (parse-integer p) 255)))
+                parts)
+         (reduce (lambda (acc p) (+ (* acc 256) (parse-integer p))) parts :initial-value 0))))
+
+(defun cidr-match-p (host cidr)
+  "True when HOST (dotted quad) lies in CIDR (\"a.b.c.d/n\" or a single address)."
+  (let* ((slash (position #\/ cidr))
+         (network (parse-ipv4 (subseq cidr 0 slash)))
+         (bits (if slash (parse-integer cidr :start (1+ slash)) 32))
+         (address (parse-ipv4 host)))
+    (and network address (<= 0 bits 32)
+         (= (ash address (- bits 32)) (ash network (- bits 32))))))
+
+(defun private-address-p (host)
+  "True for loopback, RFC 1918 and link-local addresses: peers that are
+reached directly rather than through a NAT.  Host names count as public."
+  (or (member (string-trim "[]" host) '("::1" "localhost") :test #'string-equal)
+      (some (lambda (cidr) (cidr-match-p host cidr))
+            '("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "169.254.0.0/16"))))
+
 ;;;; Identifiers
 
 (defun random-hex (n-bytes)

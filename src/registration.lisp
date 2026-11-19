@@ -5,7 +5,18 @@
 (defclass registration ()
   ((ua :initarg :ua :reader registration-ua)
    (registrar :initarg :registrar :reader registration-registrar)
-   (contact :initarg :contact :reader registration-contact)
+   (contact :initarg :contact :accessor registration-contact)
+   (explicit-contact :initarg :explicit-contact :initform nil
+                     :reader registration-explicit-contact-p)
+   (nat :initarg :nat :initform t :reader registration-nat-p
+        :documentation "Learn the public address from the registrar's replies
+and register that instead of the local one.")
+   (keepalive :initarg :keepalive :initform nil :reader registration-keepalive
+              :documentation "Seconds between keep-alive packets to the
+registrar, which hold a NAT mapping open; NIL sends none.")
+   (keepalive-timer :initform nil :accessor registration-keepalive-timer)
+   (transaction :initform nil :accessor registration-transaction
+                :documentation "The client transaction of the last REGISTER.")
    (requested-expires :initarg :expires :accessor registration-requested-expires)
    (expires :initform nil :accessor registration-expires
             :documentation "Lifetime granted by the registrar, in seconds.")
@@ -36,14 +47,23 @@
   (let ((value (param (name-addr-params contact) "expires")))
     (and value (all-digits-p value) (parse-integer value))))
 
-(defun registration-send (registration mode &key retried)
-  "MODE is :register, :unregister, :unregister-all or :fetch."
+(defun registration-send (registration mode &key retried remove)
+  "MODE is :register, :unregister, :unregister-all or :fetch.  REMOVE is a
+contact to delete in the same request."
   (let* ((ua (registration-ua registration))
          (expires (if (eq mode :register) (registration-requested-expires registration) 0))
          (request (ua-make-request ua "REGISTER" (registration-registrar registration)
                                    :to (strip-tag (ua-aor ua))
                                    :call-id (registration-call-id registration)
                                    :cseq (incf (registration-cseq registration)))))
+    (unless (registration-explicit-contact-p registration)
+      ;; The right contact depends on where the registrar is and on what has
+      ;; been learned about our public address since the last attempt.
+      (setf (registration-contact registration) (ua-contact-for ua request)))
+    (when remove
+      (let ((old (copy-name-addr remove)))
+        (setf (name-addr-params old) (set-param (name-addr-params old) "expires" "0"))
+        (add-header request "Contact" old)))
     (ecase mode
       ((:register :unregister)
        (let ((contact (copy-name-addr (registration-contact registration))))
@@ -62,7 +82,8 @@
      (lambda (creq event argument)
        ;; An authentication retry consumed a sequence number.
        (setf (registration-cseq registration)
-             (cseq-number (msg-cseq (creq-request creq))))
+             (cseq-number (msg-cseq (creq-request creq)))
+             (registration-transaction registration) (creq-transaction creq))
        (case event
          (:response
           (let ((status (response-status argument)))
@@ -92,6 +113,11 @@
          (mine (find (name-addr-uri (registration-contact registration)) bindings
                      :key #'name-addr-uri :test #'uri-equal)))
     (setf (registration-bindings registration) bindings)
+    (when (and (eq mode :register) (registration-learn-public-address registration response))
+      ;; We registered an address the registrar cannot reach us at: replace it.
+      (return-from registration-succeeded
+        (registration-send registration :register
+                           :remove (registration-contact registration))))
     (ecase mode
       (:register
        (let ((granted (or (and mine (contact-expires mine))
@@ -105,18 +131,70 @@
                            (lambda ()
                              (when (eq (registration-state registration) :registered)
                                (registration-send registration :register))))))
+         (registration-arm-keepalive registration)
          (registration-fire registration :registered :expires granted :bindings bindings)))
       ((:unregister :unregister-all)
+       (cancel-timer (registration-keepalive-timer registration))
        (setf (registration-expires registration) nil
              (registration-state registration) :unregistered)
        (registration-fire registration :unregistered :bindings bindings))
       (:fetch
        (registration-fire registration :bindings :bindings bindings)))))
 
-(defun register (ua &key registrar (expires 3600) on-event (refresh t) contact)
+(defun registration-learn-public-address (registration response)
+  "RFC 3581: the registrar reports the address our request came from in the
+Via's `received` and `rport`.  When that differs from what the request said,
+we are behind a NAT; record the public address on the transport.  Returns
+true when the public address changed."
+  (let* ((transaction (registration-transaction registration))
+         (transport (and transaction (transaction-transport transaction)))
+         (via (msg-top-via response))
+         (received (via-param via "received"))
+         (rport (let ((value (via-param via "rport")))
+                  (and value (all-digits-p value) (parse-integer value)))))
+    (when (and (registration-nat-p registration)
+               (not (registration-explicit-contact-p registration))
+               transport received rport
+               (or (not (host-equal received (via-host via)))
+                   (/= rport (or (via-port via) 5060)))
+               (not (and (equal received (transport-public-host transport))
+                         (eql rport (transport-public-port transport)))))
+      (setf (transport-public-host transport) received
+            (transport-public-port transport) rport)
+      t)))
+
+(defun registration-arm-keepalive (registration)
+  "Send a double CRLF to the registrar at intervals (the keep-alive of RFC
+5626 section 3.5.1, used here over UDP as well, as is common practice)."
+  (cancel-timer (registration-keepalive-timer registration))
+  (let ((interval (registration-keepalive registration))
+        (transaction (registration-transaction registration)))
+    (when (and interval transaction)
+      (labels ((ping ()
+                 (when (eq (registration-state registration) :registered)
+                   (ignore-errors
+                    (transport-send (transaction-transport transaction)
+                                    (coerce #(13 10 13 10) 'octets)
+                                    (transaction-host transaction)
+                                    (transaction-port transaction)
+                                    nil))
+                   (arm)))
+               (arm ()
+                 (setf (registration-keepalive-timer registration)
+                       (schedule (ua-scheduler (registration-ua registration))
+                                 interval #'ping))))
+        (arm)))))
+
+(defun register (ua &key registrar (expires 3600) on-event (refresh t) contact
+                      (nat t) keepalive)
   "Register the agent's contact with REGISTRAR (default: the domain of the
 address-of-record).  Returns a REGISTRATION; progress is reported through
-ON-EVENT.  With REFRESH, the binding is renewed at half its lifetime."
+ON-EVENT.  With REFRESH, the binding is renewed at half its lifetime.
+
+Unless NAT is NIL or CONTACT is given, a registrar that reports seeing the
+request from another address (the agent is behind a NAT) is sent a second
+REGISTER with that public address.  KEEPALIVE is the number of seconds
+between keep-alive packets to the registrar."
   (on-loop ((ua-scheduler ua))
     (let* ((aor (name-addr-uri (ua-aor ua)))
            (registrar (if registrar
@@ -129,6 +207,8 @@ ON-EVENT.  With REFRESH, the binding is renewed at half its lifetime."
                             :ua ua :registrar registrar :expires expires
                             :contact (or (and contact (ensure-name-addr contact))
                                          (ua-contact ua))
+                            :explicit-contact (and contact t)
+                            :nat nat :keepalive keepalive
                             :call-id (make-call-id) :on-event on-event :refresh refresh)))
       (registration-send registration :register))))
 

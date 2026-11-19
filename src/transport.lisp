@@ -33,7 +33,11 @@
          :documentation "Local address the transport is bound to.")
    (port :initarg :port :initform 5060 :accessor transport-port)
    (advertised-host :initarg :advertised-host :initform nil
-                    :documentation "Host to place in Via and Contact; defaults to HOST.")))
+                    :documentation "Host to place in Via and Contact; defaults to HOST.")
+   (public-host :initarg :public-host :initform nil :accessor transport-public-host
+                :documentation "Address this transport is reached at from outside
+a NAT, when known; used in Contact for peers on the public side.")
+   (public-port :initarg :public-port :initform nil :accessor transport-public-port)))
 
 (defgeneric transport-protocol (transport)
   (:documentation "Transport name as it appears in Via: \"UDP\", \"TCP\"."))

@@ -676,3 +676,103 @@
                                      dialog "OPTIONS"
                                      :cseq (1- (sip:dialog-local-seq dialog)))))))
         (is (eq :established (sip:call-state call)))))))
+
+;;;; NAT (RFC 3581) and request screening
+
+(test registration-learns-public-address-behind-nat
+  (let* ((world (new-world))
+         (registrar (sip:make-registrar))
+         (server (agent world "sip:registrar@pop.example.net" "pop.example.net"
+                        :registrar registrar))
+         ;; Bob's requests appear to come from 203.0.113.7:40000.
+         (bob (sip:make-user-agent
+               :aor "sip:bob@pop.example.net"
+               :scheduler (world-scheduler world)
+               :transports (list (sip:make-memory-transport
+                                  (world-network world) "192.168.1.20"
+                                  :nat '("203.0.113.7" . 40000))))))
+    (sip:start bob)
+    (multiple-value-bind (on-event events) (recorder)
+      (let ((registration (sip:register bob :expires 300 :keepalive 25 :on-event on-event)))
+        (settle world)
+        ;; First REGISTER carries the private contact; the reply reveals the
+        ;; public address, so a second one swaps the binding.
+        (destructuring-bind (first second) (wire-messages world "REGISTER")
+          (is (equal '("sip:bob@192.168.1.20:5060")
+                     (mapcar (lambda (c) (sip:uri-string (sip:name-addr-uri c)))
+                             (sip:msg-contacts first))))
+          (is (equal '(("sip:bob@192.168.1.20:5060" . "0") ("sip:bob@203.0.113.7:40000" . "300"))
+                     (mapcar (lambda (c)
+                               (cons (sip:uri-string (sip:name-addr-uri c))
+                                     (sip:param (sip:name-addr-params c) "expires")))
+                             (sip:msg-contacts second)))))
+        (let ((ok (first (wire-messages world 200))))
+          (is (string= "203.0.113.7" (sip:via-param (sip:msg-top-via ok) "received")))
+          (is (string= "40000" (sip:via-param (sip:msg-top-via ok) "rport"))))
+        (is (equal '("sip:bob@203.0.113.7:40000")
+                   (mapcar #'sip:uri-string
+                           (sip:registrar-lookup registrar server "sip:bob@pop.example.net"))))
+        (is (eq :registered (sip:registration-state registration)))
+        ;; Reported once, after the address was settled.
+        (is (equal '(:registered) (event-names (funcall events))))
+        (let ((transport (first (sip:stack-transports (sip:ua-stack bob)))))
+          (is (string= "203.0.113.7" (sip:transport-public-host transport)))
+          (is (= 40000 (sip:transport-public-port transport))))
+        ;; Keep-alives every 25 s; the refresh at 150 s is a single REGISTER.
+        (clear-wire world)
+        (tick world 140)
+        (is (= 5 (sip:network-keepalives (world-network world))))
+        (is (null (wire world)))
+        (tick world 15)
+        (is (equal '("REGISTER" "200/REGISTER") (wire world)))
+        ;; The server can reach Bob at his public address, and Bob answers
+        ;; with a public Contact.
+        (let (response)
+          (sip:options server "sip:bob@203.0.113.7:40000"
+                       :on-response (lambda (r) (setf response r)))
+          (settle world)
+          (is (= 200 (sip:response-status response)))
+          (is (string= "sip:bob@203.0.113.7:40000"
+                       (sip:uri-string (sip:msg-contact-uri response)))))
+        ;; No keep-alives once unregistered.
+        (sip:unregister registration)
+        (settle world)
+        (let ((count (sip:network-keepalives (world-network world))))
+          (tick world 100)
+          (is (= count (sip:network-keepalives (world-network world)))))))))
+
+(test request-filter
+  (multiple-value-bind (world alice bob) (pair)
+    (let ((handled 0))
+      (setf (sip:ua-request-filter bob)
+            (lambda (request)
+              (incf handled)
+              (cond ((string= (sip:request-method request) "OPTIONS") t)
+                    ((string= (sip:request-method request) "INVITE") 403)
+                    (t nil))))
+      (is (= 200 (sip:response-status
+                  (final-response world alice (sip:ua-make-request alice "OPTIONS" *bob*)))))
+      (is (= 403 (sip:response-status
+                  (final-response world alice (sip:ua-make-request alice "INVITE" *bob*)))))
+      ;; Dropped requests get no answer at all, and leave no state behind.
+      (clear-wire world)
+      (let ((response :none))
+        (sip:ua-send alice (sip:ua-make-request alice "BYE" *bob*)
+                     (lambda (creq event argument)
+                       (declare (ignore creq argument))
+                       (setf response event)))
+        (tick world 33)
+        (is (eq :timeout response))
+        (is (null (remove-if #'sip:request-p (sip:network-messages (world-network world)))))
+        (is (zerop (hash-table-count (sip::stack-server-transactions (sip:ua-stack bob)))))))))
+
+(test address-classification
+  (is (sip:cidr-match-p "34.210.91.120" "34.210.91.112/28"))
+  (is (not (sip:cidr-match-p "34.210.91.128" "34.210.91.112/28")))
+  (is (sip:cidr-match-p "10.1.2.3" "10.1.2.3"))
+  (is (not (sip:cidr-match-p "host.example.com" "0.0.0.0/0")))
+  (is (sip:cidr-match-p "8.8.8.8" "0.0.0.0/0"))
+  (dolist (host '("127.0.0.1" "10.0.0.5" "172.16.16.195" "172.31.255.1" "192.168.1.1" "::1"))
+    (is (sip:private-address-p host) "~a is private" host))
+  (dolist (host '("172.32.0.1" "34.210.91.112" "203.0.113.7" "sip.example.com"))
+    (is (not (sip:private-address-p host)) "~a is public" host)))

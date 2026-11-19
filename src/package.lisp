@@ -57,9 +57,11 @@
    #:transport #:add-transport #:transport-start #:transport-stop
    #:transport-protocol #:transport-reliable-p #:transport-send
    #:transport-host #:transport-port #:transport-advertised-host
+   #:transport-public-host #:transport-public-port
+   #:parse-ipv4 #:cidr-match-p #:private-address-p
    #:make-udp-transport #:make-tcp-transport
    #:memory-network #:make-memory-network #:make-memory-transport
-   #:network-filter #:network-messages
+   #:network-filter #:network-messages #:network-keepalives
 
    ;; transactions
    #:transaction #:transaction-state #:transaction-request #:transaction-tu
@@ -74,7 +76,7 @@
    ;; user agent
    #:user-agent #:make-user-agent #:start #:stop #:ua-stack #:ua-aor
    #:ua-contact #:ua-credentials #:ua-outbound-proxy #:ua-on-incoming-call
-   #:ua-registrar #:ua-user-agent-name #:ua-media #:ua-scheduler
+   #:ua-registrar #:ua-request-filter #:ua-user-agent-name #:ua-media #:ua-scheduler
    #:ua-make-request #:ua-send #:ua-respond #:options #:wait-until
    #:client-request #:creq-request #:creq-transaction
 
