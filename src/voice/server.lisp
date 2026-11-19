@@ -360,6 +360,10 @@ a STUN server (\"host:port\")."
                                         (null nil)
                                         (cons stun)
                                         (string (parse-host-port stun 3478))))))
+    ;; Tool calls the model makes are worth seeing next to the conversation.
+    (when (and (typep llm 'claude-llm) (null (llm-log llm)))
+      (setf (llm-log llm)
+            (lambda (who text) (server-log server "~(~a~): ~a" who text))))
     (setf (sip:ua-request-filter ua)
           (lambda (request) (server-screen-request server request))
           (sip:ua-on-incoming-call ua)
@@ -392,6 +396,52 @@ processes the backends run."
 
 ;;; Configuration from the environment (bin/voice-server)
 
+(defparameter *wiki-instructions*
+  (format nil "The tools reach a personal wiki of pages on concepts, people ~
+and sources, and you are its voice: the caller is talking with you about ~
+what is in it. Its catalog follows these instructions: every page, with a ~
+line on each. Treat the catalog as a map, not a source. It shows what ~
+exists and what to read, but a one-line summary is not enough to answer ~
+from. A name in double brackets is a page: a bare name is one of the ~
+wiki's own pages, wp: a cached Wikipedia article, rldev:, osdev: and lm: ~
+other cached wikis, source: text extracted from a source and raw: a raw ~
+source; read_page takes any of them. With each thing the caller says you are given a list of wiki ~
+pages that may bear on it, found by searching for their words. The list has ~
+only names and snippets, so when the caller asks about something the wiki ~
+might cover, read the one or two most promising pages, from the list or the ~
+catalog, with read_page, ~
+several at once if you like, before you answer. Prefer the wiki's own pages ~
+to raw sources and cached Wikipedia articles, and follow a double-bracketed ~
+link in a page when the answer lies behind it. The list is only a first ~
+guess, and the catalog covers only the wiki's own pages, not the cached ~
+wikis and sources, which only a search finds. So if neither has a fitting ~
+page, always search again in other words, plainer ~
+and shorter, before concluding that the wiki has nothing. Ignore the list ~
+when the caller is only chatting.
+
+Answer from what the pages say, as conversation. Give the gist in two or ~
+three sentences, mentioning in passing which page it comes from, then stop ~
+and offer in a few words to go further; never recite a page or list ~
+everything it covers. The pages are written in Markdown, and none of its ~
+marks, such as asterisks or brackets, may appear in what you say. Let the caller steer, and read ~
+further pages as the talk moves on. If the wiki has nothing on the subject, ~
+say so, then offer what you know yourself, making clear it is not from the ~
+wiki. Use the graph query only for questions about how entries relate, such ~
+as who wrote a work or who influenced whom.")
+  "How the agent is to use the LLM-wiki tools.  This is the routine of the
+wiki's own ask_wiki (candidates from a search, then reading pages, then an
+answer grounded in them) carried out by the model, turn by turn.")
+
+(defparameter *wiki-seed*
+  (list :tool "search" :argument "query" :extra '("n" 8)
+        :header (format nil "Wiki pages that may bear on what the caller just ~
+said (names and snippets only; read a page before relying on it):"))
+  "The search run on each thing the caller says; see MAKE-MCP-SERVER.")
+
+(defparameter *wiki-pinned*
+  '(("The wiki's catalog: every page, with a one-line summary" "read_page" "ref" "index"))
+  "What the agent has before it throughout a call; see MAKE-MCP-SERVER.")
+
 (defun env (name)
   (uiop:getenvp name))
 
@@ -415,6 +465,11 @@ processes the backends run."
   VOICE_MAX_CALLS               agent calls at once (2)
   VOICE_RTP_PORTS               e.g. 40000-40019, a UDP range forwarded to here
   VOICE_STUN                    STUN server, host:port
+  VOICE_WIKI_TOKEN              capability token for the LLM-wiki MCP server;
+                                setting it lets the agent consult the wiki
+  VOICE_WIKI_URL                where that server is (http://localhost:8788/mcp)
+  VOICE_WIKI_EXCLUDE            comma-separated wiki tools to withhold (ask_wiki,
+                                which takes too long for a phone call)
 
 OVERRIDES are START-SERVER keyword arguments that take precedence."
   (let* ((trunk (and (env "FLOWROUTE_USERNAME") (env "FLOWROUTE_PASSWORD")
@@ -437,6 +492,20 @@ OVERRIDES are START-SERVER keyword arguments that take precedence."
                                        (cons (parse-integer ports :end dash)
                                              (parse-integer ports :start (1+ dash))))
                   :stun (env "VOICE_STUN")
+                  :llm (make-claude-llm
+                        ;; Room for a few whole pages, and for a second search.
+                        :max-tool-result 40000 :max-tool-rounds 6
+                        :tools (when (env "VOICE_WIKI_TOKEN")
+                                 (list (make-mcp-server
+                                        :name "llm-wiki"
+                                        :url (or (env "VOICE_WIKI_URL")
+                                                 "http://localhost:8788/mcp")
+                                        :token (env "VOICE_WIKI_TOKEN")
+                                        :instructions *wiki-instructions*
+                                        :seed *wiki-seed*
+                                        :pinned *wiki-pinned*
+                                        :exclude (or (env-list "VOICE_WIKI_EXCLUDE")
+                                                     '("ask_wiki"))))))
                   :tts (if (equal (env "VOICE_TTS") "chatterbox")
                            (make-chatterbox-tts :voice (env "VOICE_REFERENCE"))
                            (make-say-tts)))))))

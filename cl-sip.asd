@@ -45,6 +45,7 @@
     ((:file "package")
      (:file "audio")
      (:file "vad")
+     (:file "tools")
      (:file "backends")
      (:file "agent")
      (:file "server")))))

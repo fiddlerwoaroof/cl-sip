@@ -191,6 +191,48 @@ From Lisp the same thing is the `:trunk` argument:
 
 Placing calls out through the trunk is not implemented yet.
 
+### Looking things up in the wiki
+
+With a capability token for the LLM-wiki MCP server, the agent can consult
+the wiki during a call. Put the token in `.envrc.local`:
+
+```sh
+VOICE_WIKI_TOKEN=...                           # must carry the mcp capability
+VOICE_WIKI_URL=http://localhost:8788/mcp       # the default
+```
+
+`bin/voice-server` then checks that the wiki accepts the token. The server's
+tools are offered to the model, apart from `ask_wiki`: it has a local model
+write the answer, which takes longer than a caller will wait, so the agent
+follows the same routine itself, a turn at a time: whatever the caller says
+is searched for (about 0.2 s) and the hits go to the model with their words;
+it reads the most promising pages, searches again if they miss, and answers
+briefly from them, ready for a follow-up. The wiki's catalog (`index`) rides
+along in the system prompt as a map of what exists; it is long, so it is
+marked for prompt caching and costs little after a call's first turn. `VOICE_WIKI_EXCLUDE`, a
+comma-separated list, changes which tools are withheld. The model says a few words ("Let me check"),
+calls a tool, and answers from the result; each call appears in the log as a
+`tool:` line. If the wiki is down or refuses the token, the agent carries on
+without it and the log says why; a wiki that does not answer is left alone
+for a minute, so it costs a caller one five-second wait rather than one per
+turn. Lookups last for one reply: what was said
+is remembered for the rest of the call, the pages read are not.
+
+Anyone who reaches the agent can ask it about the wiki, so set
+`VOICE_ALLOWED_CALLERS` when a trunk is connected.
+
+From Lisp, any MCP server reached over HTTP works, as do plain functions:
+
+```lisp
+(cl-sip.voice:start-server
+ :llm (cl-sip.voice:make-claude-llm
+       :tools (list (cl-sip.voice:make-mcp-server
+                     :url "http://localhost:8788/mcp" :token "...")
+                    (cl-sip.voice:make-function-tool
+                     "current_time" "The current time."
+                     (lambda (input) (declare (ignore input)) "half past nine")))))
+```
+
 ### A cloned voice
 
 `make-chatterbox-tts` speaks with the Chatterbox Turbo model, which can
@@ -232,7 +274,7 @@ and `make-command-tts` runs a program once per sentence:
 | `src/dialog.lisp`, `ua.lisp`, `registration.lisp`, `call.lisp` | Dialogs and the UA core |
 | `src/sdp/` | Package `cl-sip.sdp`: SDP and offer/answer |
 | `src/rtp/` | Package `cl-sip.rtp`: RTP packets, G.711, DTMF, a simple session |
-| `src/voice/` | Package `cl-sip.voice`: audio helpers, voice agent, phone server |
+| `src/voice/` | Package `cl-sip.voice`: audio helpers, voice agent, tools (MCP client), phone server |
 | `t/` | Tests; protocol tests run on a virtual clock over an in-memory network |
 
 ## Testing without a network

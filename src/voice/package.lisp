@@ -18,6 +18,9 @@
    #:function-stt #:make-function-stt #:function-tts #:make-function-tts
    #:llm-error #:*phone-system-prompt*
    #:split-sentences
+   ;; tools
+   #:list-tools #:call-tool #:function-tool #:make-function-tool
+   #:mcp-server #:make-mcp-server #:mcp-error
    ;; agent
    #:voice-agent #:start-agent #:stop-agent #:agent-messages
    ;; server

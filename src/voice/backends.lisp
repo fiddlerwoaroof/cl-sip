@@ -207,6 +207,13 @@ only if it seems wanted. Never use formatting of any kind, because it would ~
 be read aloud: no lists, headings, asterisks, emoji or code. Write numbers, ~
 dates and abbreviations the way they should be pronounced."))
 
+(defparameter *tool-prompt*
+  (format nil "You can look things up with tools. A lookup takes a few ~
+seconds, during which the caller hears nothing, so say a few words first, ~
+such as \"Let me check.\" Then answer from what you found in your own words, ~
+briefly; never read out long passages, page addresses or raw data.")
+  "Added to the system prompt when the model has tools.")
+
 (defclass claude-llm ()
   ((model :initarg :model :initform "claude-haiku-5-5")
    (system :initarg :system :initform *phone-system-prompt*)
@@ -216,69 +223,133 @@ dates and abbreviations the way they should be pronounced."))
              :documentation "NIL turns thinking off, for the quickest first word.")
    (api-key :initarg :api-key :initform nil
             :documentation "Defaults to $ANTHROPIC_API_KEY, read at request time.")
+   (tools :initarg :tools :initform '()
+          :documentation "Tool providers (see LIST-TOOLS) the model may call.")
+   (max-tool-rounds :initarg :max-tool-rounds :initform 4
+                    :documentation "Rounds of tool calls allowed in one reply.")
+   (max-tool-result :initarg :max-tool-result :initform 12000
+                    :documentation "Characters of a tool result passed to the model.")
+   (log :initarg :log :initform nil :accessor llm-log
+        :documentation "(lambda (who text)) told of tool calls and failures;
+WHO is :tool or :error.")
    (program :initarg :program :initform "curl")
    (url :initarg :url :initform "https://api.anthropic.com/v1/messages")
-   (process :initform nil)))
+   (process :initform nil)
+   (aborted :initform nil)))
 
 (defun make-claude-llm (&rest args &key model system max-tokens effort thinking api-key
+                                     tools max-tool-rounds max-tool-result log
                                      program url)
   "Reply with a Claude model (Claude Haiku 5.5 by default) through the
-Messages API, streaming so speech can start with the first sentence."
-  (declare (ignore model system max-tokens effort thinking api-key program url))
+Messages API, streaming so speech can start with the first sentence.  TOOLS
+is a list of tool providers, such as MAKE-MCP-SERVER returns, that the model
+may call while replying."
+  (declare (ignore model system max-tokens effort thinking api-key tools max-tool-rounds
+                   max-tool-result log program url))
   (apply #'make-instance 'claude-llm args))
 
-(defun json-object (&rest plist)
-  (let ((table (make-hash-table :test #'equal)))
-    (loop for (key value) on plist by #'cddr
-          do (setf (gethash key table) value))
-    table))
+(defun llm-note (llm who control &rest args)
+  (when (llm-log llm)
+    (ignore-errors (funcall (llm-log llm) who (apply #'format nil control args)))))
 
-(defun claude-request-body (llm messages)
+(defun claude-request-body (llm messages &key tools instructions reference
+                                           (allow-tools t))
+  "MESSAGES are (role . text) pairs or ready-made message objects.  TOOLS
+are tool definitions, INSTRUCTIONS their providers' advice on using them and
+REFERENCE their standing reference material; with ALLOW-TOOLS false the
+model must answer without calling one."
   (with-slots (model system max-tokens effort thinking) llm
     (jzon:stringify
-     (json-object
-      "model" model
-      "max_tokens" max-tokens
-      "stream" t
-      "system" system
-      "thinking" (json-object "type" (if thinking "adaptive" "disabled"))
-      "output_config" (json-object "effort" effort)
-      "messages" (map 'vector
-                      (lambda (m)
-                        (json-object "role" (string-downcase (symbol-name (car m)))
-                                     "content" (cdr m)))
-                      messages)))))
+     (apply #'json-object
+            "model" model
+            "max_tokens" max-tokens
+            "stream" t
+            "system" (let ((text (if tools
+                                     (format nil "~a~%~%~a~{~%~%~a~}" system *tool-prompt*
+                                             instructions)
+                                     system)))
+                       (if reference
+                           ;; Long and the same every turn: cached, with the
+                           ;; tool definitions before it, so that only the
+                           ;; conversation is read afresh.
+                           (vector (json-object
+                                    "type" "text"
+                                    "text" (format nil "~a~{~%~%~a~}" text reference)
+                                    "cache_control" (json-object "type" "ephemeral")))
+                           text))
+            "thinking" (json-object "type" (if thinking "adaptive" "disabled"))
+            "output_config" (json-object "effort" effort)
+            "messages" (map 'vector
+                            (lambda (m)
+                              (if (hash-table-p m)
+                                  m
+                                  (json-object "role" (string-downcase (symbol-name (car m)))
+                                               "content" (cdr m))))
+                            messages)
+            (when tools
+              (list "tools" (coerce tools 'vector)
+                    "tool_choice" (json-object "type" (if allow-tools "auto" "none"))))))))
 
-(defun handle-stream-event (event on-text)
+(defun handle-stream-event (event on-text &optional blocks)
   "Process one decoded server-sent event.  Returns the stop reason when the
-event carries one."
-  (let ((type (gethash "type" event)))
-    (cond
-      ((equal type "content_block_delta")
-       (let ((delta (gethash "delta" event)))
-         (when (equal (gethash "type" delta) "text_delta")
-           (funcall on-text (gethash "text" delta))))
-       nil)
-      ((equal type "message_delta")
-       (let ((reason (gethash "stop_reason" (gethash "delta" event))))
-         (and (stringp reason) reason)))
-      ((equal type "error")
-       (let ((detail (gethash "error" event)))
-         (error 'llm-error
-                :message (format nil "~a: ~a" (gethash "type" detail)
-                                 (gethash "message" detail))))))))
+event carries one.  The content blocks of the reply are assembled in the
+hash table BLOCKS, by index, when it is given."
+  (let* ((type (gethash "type" event))
+         (block (and blocks (gethash (gethash "index" event) blocks))))
+    (flet ((extend (key piece)
+             (when block
+               (setf (gethash key block)
+                     (concatenate 'string (or (gethash key block) "") piece)))))
+      (cond
+        ((equal type "content_block_start")
+         (when blocks
+           (let ((new (gethash "content_block" event)))
+             ;; A tool's arguments arrive as pieces of JSON text.
+             (when (equal (gethash "type" new) "tool_use")
+               (setf (gethash "input" new) ""))
+             (setf (gethash (gethash "index" event) blocks) new)))
+         nil)
+        ((equal type "content_block_delta")
+         (let* ((delta (gethash "delta" event))
+                (kind (gethash "type" delta)))
+           (cond ((equal kind "text_delta")
+                  (extend "text" (gethash "text" delta))
+                  (funcall on-text (gethash "text" delta)))
+                 ((equal kind "input_json_delta")
+                  (extend "input" (gethash "partial_json" delta)))
+                 ((equal kind "thinking_delta")
+                  (extend "thinking" (gethash "thinking" delta)))
+                 ((equal kind "signature_delta")
+                  (when block
+                    (setf (gethash "signature" block) (gethash "signature" delta))))))
+         nil)
+        ((equal type "content_block_stop")
+         (when (and block (equal (gethash "type" block) "tool_use"))
+           (let ((json (gethash "input" block)))
+             (setf (gethash "input" block)
+                   (if (and (stringp json) (find #\{ json))
+                       (jzon:parse json)
+                       (json-object)))))
+         nil)
+        ((equal type "message_delta")
+         (let ((reason (gethash "stop_reason" (gethash "delta" event))))
+           (and (stringp reason) reason)))
+        ((equal type "error")
+         (let ((detail (gethash "error" event)))
+           (error 'llm-error
+                  :message (format nil "~a: ~a" (gethash "type" detail)
+                                   (gethash "message" detail)))))))))
 
-(defmethod respond ((llm claude-llm) messages on-text)
-  (with-slots (api-key program url process) llm
-    (let ((key (or api-key (uiop:getenv "ANTHROPIC_API_KEY")))
-          (text (make-string-output-stream))
+(defun claude-stream (llm key body on-text)
+  "Send the request BODY and follow the streamed reply.  Returns its content
+blocks in order and the stop reason."
+  (with-slots (program url process) llm
+    (let ((blocks (make-hash-table))
           (stop-reason nil))
-      (unless (and key (plusp (length key)))
-        (error 'llm-error :message "ANTHROPIC_API_KEY is not set"))
-      (uiop:with-temporary-file (:pathname body :type "json")
-        (with-open-file (out body :direction :output :if-exists :supersede
+      (uiop:with-temporary-file (:pathname file :type "json")
+        (with-open-file (out file :direction :output :if-exists :supersede
                                   :external-format :utf-8)
-          (write-string (claude-request-body llm messages) out))
+          (write-string body out))
         ;; The request, key included, goes to curl on standard input so that
         ;; it never appears in the process list.
         (let ((curl (uiop:launch-program (list program "--silent" "--show-error"
@@ -293,7 +364,7 @@ event carries one."
                    (format config "header = \"x-api-key: ~a\"~%" key)
                    (format config "header = \"anthropic-version: 2026-10-21\"~%")
                    (format config "header = \"content-type: application/json\"~%")
-                   (format config "data-binary = \"@~a\"~%" (namestring body))
+                   (format config "data-binary = \"@~a\"~%" (namestring file))
                    (close config))
                  (loop with output = (uiop:process-info-output curl)
                        for line = (read-line output nil nil)
@@ -302,10 +373,7 @@ event carries one."
                             (cond
                               ((alexandria:starts-with-subseq "data:" line)
                                (let ((reason (handle-stream-event
-                                              (jzon:parse (subseq line 5))
-                                              (lambda (piece)
-                                                (write-string piece text)
-                                                (funcall on-text piece)))))
+                                              (jzon:parse (subseq line 5)) on-text blocks)))
                                  (when reason (setf stop-reason reason))))
                               ;; A failed request answers with one JSON object
                               ;; instead of an event stream.
@@ -316,9 +384,146 @@ event carries one."
               (uiop:terminate-process curl))
             (uiop:wait-process curl)
             (ignore-errors (uiop:close-streams curl)))))
+      (values (loop for index in (sort (alexandria:hash-table-keys blocks) #'<)
+                    for block = (gethash index blocks)
+                    ;; An empty text block may not be sent back.
+                    unless (and (equal (gethash "type" block) "text")
+                                (equal (gethash "text" block) ""))
+                      collect block)
+              stop-reason))))
+
+(defun claude-tools (llm)
+  "The definitions of every tool LLM may call, an alist from tool name to
+provider, and the providers' instructions.  A provider that cannot be reached
+is left out."
+  (let ((definitions '())
+        (providers '())
+        (instructions '()))
+    (dolist (provider (slot-value llm 'tools))
+      (handler-case
+          (dolist (definition (list-tools provider))
+            (push definition definitions)
+            (push (cons (gethash "name" definition) provider) providers)
+            (pushnew (tool-instructions provider) instructions :test #'equal))
+        (error (e)
+          (llm-note llm :error "tools unavailable: ~a" e))))
+    (values (nreverse definitions) providers (remove nil (nreverse instructions)))))
+
+(defun spoken-query (messages)
+  "What the caller has just said, with the remark before it so that a
+follow-up such as \"who influenced him?\" still finds its subject."
+  (let ((said (loop for m in (reverse messages)
+                    when (and (consp m) (eq (car m) :user)) collect (cdr m))))
+    (when (and said (consp (car (last messages))) (eq (car (car (last messages))) :user))
+      (let ((query (format nil "~{~a~^~%~}" (reverse (subseq said 0 (min 2 (length said)))))))
+        (subseq query (max 0 (- (length query) 500)))))))
+
+(defun claude-context (llm providers messages)
+  "What the tool providers have found for the caller's latest words."
+  (let ((query (spoken-query messages)))
+    (when query
+      (loop for provider in (remove-duplicates (mapcar #'cdr providers))
+            for text = (handler-case (tool-context provider query)
+                         (error (e)
+                           (llm-note llm :error "no context: ~a" e)
+                           nil))
+            when text
+              do (llm-note llm :tool "~d characters of context for ~s" (length text) query)
+              and collect text))))
+
+(defun add-context (messages context)
+  "MESSAGES with the texts CONTEXT attached to the last one, the caller's."
+  (if (null context)
+      messages
+      (append (butlast messages)
+              (let ((last (car (last messages))))
+                (list (json-object
+                       "role" "user"
+                       "content" (map 'vector
+                                      (lambda (text) (json-object "type" "text" "text" text))
+                                      (cons (cdr last) context))))))))
+
+(defun claude-reference (llm providers)
+  "The standing reference material of the tool providers."
+  (loop for provider in (remove-duplicates (mapcar #'cdr providers))
+        for text = (handler-case (tool-reference provider)
+                     (error (e)
+                       (llm-note llm :error "no reference material: ~a" e)
+                       nil))
+        when text collect text))
+
+(defun claude-run-tool (llm providers call)
+  "Carry out the tool_use block CALL.  Returns the tool_result block."
+  (let ((name (gethash "name" call))
+        (input (gethash "input" call))
+        (limit (slot-value llm 'max-tool-result)))
+    (llm-note llm :tool "~a ~a" name (jzon:stringify input))
+    (multiple-value-bind (text error-p)
+        (handler-case
+            (let ((provider (cdr (assoc name providers :test #'equal))))
+              (if provider
+                  (call-tool provider name input)
+                  (values (format nil "There is no tool named ~a." name) t)))
+          (error (e) (values (princ-to-string e) t)))
+      (when error-p
+        (llm-note llm :error "~a failed: ~a" name text))
+      (json-object "type" "tool_result"
+                   "tool_use_id" (gethash "id" call)
+                   "is_error" (and error-p t)
+                   "content" (cond ((zerop (length text)) "(no output)")
+                                   ((> (length text) limit)
+                                    (format nil "~a~%[truncated]" (subseq text 0 limit)))
+                                   (t text))))))
+
+(defmethod respond ((llm claude-llm) messages on-text)
+  (with-slots (api-key max-tool-rounds aborted) llm
+    (let ((key (or api-key (uiop:getenv "ANTHROPIC_API_KEY")))
+          (text (make-string-output-stream))
+          (stop-reason nil))
+      (unless (and key (plusp (length key)))
+        (error 'llm-error :message "ANTHROPIC_API_KEY is not set"))
+      (setf aborted nil)
+      (multiple-value-bind (tools providers instructions) (claude-tools llm)
+        (setf messages (add-context messages (claude-context llm providers messages)))
+        (let ((reference (claude-reference llm providers)))
+        (flet ((emit (piece)
+                 (write-string piece text)
+                 (funcall on-text piece)))
+          (loop
+            for round from 0
+            do (multiple-value-bind (blocks reason)
+                   (claude-stream llm key
+                                  (claude-request-body llm messages
+                                                       :tools tools
+                                                       :instructions instructions
+                                                       :reference reference
+                                                       ;; The last round has to be an answer.
+                                                       :allow-tools (< round max-tool-rounds))
+                                  #'emit)
+                 (setf stop-reason reason)
+                 (let ((calls (remove "tool_use" blocks
+                                      :key (lambda (b) (gethash "type" b))
+                                      :test-not #'equal)))
+                   (when (or (not (equal reason "tool_use")) (null calls) aborted
+                             (>= round max-tool-rounds))
+                     (return))
+                   ;; End the sentence said so far, so that it is spoken
+                   ;; while the tools run.
+                   (emit (string #\Newline))
+                   (let ((results (map 'vector
+                                       (lambda (call) (claude-run-tool llm providers call))
+                                       calls)))
+                     (when aborted (return))
+                     (setf messages
+                           (append messages
+                                   (list (json-object "role" "assistant"
+                                                      "content" (coerce blocks 'vector))
+                                         (json-object "role" "user"
+                                                      "content" results)))))))))))
       (values (get-output-stream-string text) stop-reason))))
 
 (defmethod abort-response ((llm claude-llm))
+  (setf (slot-value llm 'aborted) t)
   (let ((process (slot-value llm 'process)))
     (when process
       (ignore-errors (uiop:terminate-process process)))))

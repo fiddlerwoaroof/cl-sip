@@ -86,10 +86,16 @@ an older generation is discarded.")
 
 ;;; Turns (worker thread)
 
+(defun speakable (text)
+  "TEXT without the formatting marks a model lets slip, which would be read
+aloud: emphasis, headings, code quotes and wiki-link brackets."
+  (string-trim " " (remove-if (lambda (c) (find c "*#`[]")) text)))
+
 (defun agent-speak (agent text generation)
   "Synthesize TEXT and queue it, unless the caller has interrupted since
 GENERATION.  Returns true when the audio was queued."
-  (when (= generation (agent-generation agent))
+  (when (and (= generation (agent-generation agent))
+             (find-if #'alphanumericp (setf text (speakable text))))
     (let ((samples (synthesize (agent-tts agent) text)))
       (when (= generation (agent-generation agent))
         (audio-out-enqueue (agent-out agent) samples)

@@ -25,6 +25,11 @@
 #     VOICE_HOST, VOICE_PORT   listen address (127.0.0.1, or 0.0.0.0 with a
 #                              trunk; port 5060)
 #     VOICE_ALLOW              comma-separated networks whose phones may call
+#     VOICE_WIKI_TOKEN         capability token for the LLM-wiki MCP server; with
+#                              it the agent can look things up in the wiki
+#     VOICE_WIKI_URL           that server's address (http://localhost:8788/mcp)
+#     VOICE_WIKI_EXCLUDE       wiki tools to withhold, comma-separated (default
+#                              ask_wiki, which is too slow for a phone call)
 #     VOICE_TTS                "chatterbox" for the cloned-voice model
 #     VOICE_REFERENCE          recording of the voice for Chatterbox to imitate
 
@@ -90,6 +95,30 @@ echo "Model"
 if is_set ANTHROPIC_API_KEY; then ok "ANTHROPIC_API_KEY is set"
 else bad "ANTHROPIC_API_KEY is not set"; fi
 
+echo "Wiki"
+if is_set VOICE_WIKI_TOKEN; then
+  wiki_url=${VOICE_WIKI_URL:-http://localhost:8788/mcp}
+  # The token goes to curl on standard input, not on its command line.
+  wiki_status=$(
+    {
+      printf 'url = "%s"\n' "$wiki_url"
+      printf 'header = "Authorization: Bearer %s"\n' "$VOICE_WIKI_TOKEN"
+      printf 'header = "content-type: application/json"\n'
+      printf 'header = "accept: application/json, text/event-stream"\n'
+    } | curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 \
+          --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"voice-server-check","version":"0.1"}}}' \
+          --config - 2>/dev/null
+  )
+  case "$wiki_status" in
+    2??) ok "wiki answers at $wiki_url" ;;
+    401|403) warn "the wiki at $wiki_url rejects VOICE_WIKI_TOKEN (does it carry the mcp capability?): the agent will run without it" ;;
+    000|"") warn "no wiki server at $wiki_url: the agent will run without it until one is there" ;;
+    *) warn "the wiki at $wiki_url answered HTTP $wiki_status: the agent may be unable to use it" ;;
+  esac
+else
+  note "no VOICE_WIKI_TOKEN: the agent has no wiki access"
+fi
+
 echo "Speech"
 case "${VOICE_TTS:-say}" in
   say)
@@ -140,7 +169,12 @@ if [ "$trunk" = 1 ]; then
     warn "neither VOICE_RTP_PORTS nor VOICE_STUN is set: callers may hear nothing"
   fi
   if is_set VOICE_ALLOWED_CALLERS; then ok "answering only the listed callers"
-  else warn "VOICE_ALLOWED_CALLERS is not set: anyone who calls the number reaches the model"; fi
+  else
+    warn "VOICE_ALLOWED_CALLERS is not set: anyone who calls the number reaches the model"
+    if is_set VOICE_WIKI_TOKEN; then
+      warn "...and can therefore ask it what is in the wiki"
+    fi
+  fi
   case "${VOICE_HOST:-0.0.0.0}" in
     127.*|localhost) bad "VOICE_HOST is loopback, which Flowroute cannot reach; unset it" ;;
   esac
