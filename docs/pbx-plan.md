@@ -161,7 +161,7 @@ Updated as phases land.
 |---|---|
 | 1 Directory and authentication | done |
 | 2 Bridged calls | done |
-| 3 Changes during a call | planned |
+| 3 Changes during a call | done |
 | 4 Forwarding | planned |
 | 5 Transfer | planned |
 | 6 Dialling out | planned |

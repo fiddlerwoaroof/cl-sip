@@ -72,9 +72,29 @@ for the trunk, local for a phone."
     (setf (rtp:rtp-session-remote-host (leg-session leg)) host
           (rtp:rtp-session-remote-port (leg-session leg)) port)))
 
-(defun leg-answer-offer (server leg offer-text &key (direction :sendrecv) version)
-  "Answer the far end's offer on LEG (RFC 3264 section 6).  Returns the
-answer as text, or NIL when the offer has no audio we can take."
+(defun leg-next-version (leg)
+  "The o= version for the next description sent on LEG: each one that
+differs from the last must count up (RFC 3264 section 8)."
+  (let ((last (leg-local-sdp leg)))
+    (if last
+        (princ-to-string
+         (1+ (or (parse-integer (sdp:origin-session-version (sdp:session-origin last))
+                                :junk-allowed t)
+                 0)))
+        "1")))
+
+(defun offered-direction (offer)
+  "The direction of the audio stream in OFFER, from the offerer's side."
+  (let ((audio (find-if (lambda (m) (and (string-equal (sdp:media-type m) "audio")
+                                         (not (sdp:media-rejected-p m))))
+                        (sdp:session-media offer))))
+    (if audio (sdp:media-direction audio offer) :inactive)))
+
+(defun leg-answer-offer (server leg offer-text &key (direction :sendrecv))
+  "Answer the far end's offer on LEG (RFC 3264 section 6); DIRECTION is
+what the server would like, cut down to what the offer allows.  Returns the
+answer as text, or NIL when the offer has no audio we can take.  As a second
+value, the direction the far end offered."
   (let ((offer (ignore-errors (sdp:parse-sdp (or offer-text "")))))
     (when offer
       (multiple-value-bind (address port) (leg-address server leg)
@@ -83,7 +103,7 @@ answer as text, or NIL when the offer has no audio we can take."
                                    :session-id (and (leg-local-sdp leg)
                                                     (sdp:origin-session-id
                                                      (sdp:session-origin (leg-local-sdp leg))))
-                                   :session-version (or version "1"))
+                                   :session-version (leg-next-version leg))
           (when accepted
             (multiple-value-bind (codecs answered-direction host remote-port)
                 (sdp:negotiated-audio answer offer)
@@ -91,7 +111,8 @@ answer as text, or NIL when the offer has no audio we can take."
               (when (leg-set-codecs leg codecs)
                 (leg-set-remote leg host remote-port)
                 (setf (leg-local-sdp leg) answer
-                      (leg-sdp-text leg) (sdp:sdp-string answer))))))))))
+                      (leg-sdp-text leg) (sdp:sdp-string answer))
+                (values (leg-sdp-text leg) (offered-direction offer))))))))))
 
 (defun leg-make-offer (server leg)
   "The server's own offer for an outgoing LEG, as text."
@@ -277,18 +298,71 @@ anything else means nobody is available."
        (multiple-value-call #'bridge-fail bridge
          (bridge-failure (bridge-outcomes bridge)))))))
 
-(defun bridge-fork-event (bridge leg event &key sdp status cause &allow-other-keys)
+;;; Changes during the call (RFC 3264 section 8, RFC 6337, RFC 5359 section 2.1)
+
+(defun bridge-peer (bridge leg)
+  (if (eq leg (bridge-a bridge)) (bridge-b bridge) (bridge-a bridge)))
+
+(defun leg-reoffer (leg held)
+  "Send LEG a new offer that says whether the other party has it on hold:
+sendonly for held, so that its phone shows the call as held (RFC 5359
+section 2.1), sendrecv again afterwards."
+  (let ((offer (if held
+                   (sdp:hold (leg-local-sdp leg))
+                   (sdp:resume (leg-local-sdp leg)))))
+    (setf (leg-local-sdp leg) offer
+          (leg-sdp-text leg) (sdp:sdp-string offer))
+    (sip:reinvite (leg-call leg) :sdp (leg-sdp-text leg))))
+
+(defun bridge-leg-offer (bridge leg sdp)
+  "LEG's phone sent a new offer in a re-INVITE or UPDATE: answer it from
+what it asks for, and pass a hold or resume on to the other party."
+  (let* ((server (bridge-server bridge))
+         (call (leg-call leg))
+         (peer (bridge-peer bridge leg)))
+    (cond
+      ((null sdp)
+       ;; A re-INVITE without an offer asks for ours: the current one.
+       (sip:answer call :sdp (leg-sdp-text leg)))
+      (t
+       (multiple-value-bind (answer offered)
+           (leg-answer-offer server leg sdp
+                             ;; Held by the other party: we only send.
+                             :direction (if (and peer (leg-held peer)) :sendonly :sendrecv))
+         (cond
+           ((null answer) (sip:reject call 488))
+           (t
+            (sip:answer call :sdp answer)
+            (let ((held (and (member offered '(:sendonly :inactive)) t)))
+              (unless (eq held (leg-held leg))
+                (setf (leg-held leg) held)
+                (bridge-log bridge "~:[resumed~;on hold~]" held)
+                (when (and peer (eq (bridge-state bridge) :connected))
+                  (leg-reoffer peer held)))))))))))
+
+(defun bridge-leg-event (bridge leg event &key sdp status &allow-other-keys)
+  "Events of an established leg, either side."
+  (case event
+    (:reinvite (bridge-leg-offer bridge leg sdp))
+    (:reinvite-accepted (when sdp (leg-accept-answer leg sdp)))
+    (:reinvite-rejected
+     (bridge-log bridge "a phone refused a change to the call (~a)" status))))
+
+(defun bridge-fork-event (bridge leg event &rest args &key sdp status cause
+                          &allow-other-keys)
   (case event
     (:ringing (bridge-ring bridge))
     (:progress (if sdp
                    (bridge-early-media bridge leg sdp)
                    (bridge-ring bridge)))
     (:established (bridge-answered bridge leg sdp))
-    (:terminated (bridge-fork-ended bridge leg status cause))))
+    (:terminated (bridge-fork-ended bridge leg status cause))
+    (t (apply #'bridge-leg-event bridge leg event args))))
 
-(defun bridge-a-event (bridge event &key cause &allow-other-keys)
+(defun bridge-a-event (bridge event &rest args &key cause &allow-other-keys)
   (case event
-    (:terminated (bridge-end bridge cause))))
+    (:terminated (bridge-end bridge cause))
+    (t (apply #'bridge-leg-event bridge (bridge-a bridge) event args))))
 
 (defun bridge-call (server a targets &key from headers (label "call") on-failed
                                        (ring-seconds (server-ring-seconds server)))
@@ -301,6 +375,8 @@ call is from, as the called phones will see it."
                                        :on-failed on-failed))
         (ua (server-ua server)))
     (push bridge (server-bridges server))
+    ;; The bridge answers changes to either call itself, from what is asked.
+    (setf (sip:call-auto-answer-reinvite (leg-call a)) nil)
     (setf (sip:call-on-event (leg-call a))
           (lambda (call event &rest args)
             (declare (ignore call))
@@ -310,6 +386,7 @@ call is from, as the called phones will see it."
         (push leg (bridge-forks bridge))
         (setf (leg-call leg)
               (sip:invite ua (getf target :uri)
+                          :auto-answer-reinvite nil
                           :to (getf target :to) :from from
                           :sdp (leg-make-offer server leg)
                           :headers headers

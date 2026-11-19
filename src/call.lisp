@@ -1,7 +1,7 @@
 (in-package :cl-sip)
 
-;;;; Sessions: INVITE, ACK, CANCEL, BYE, re-INVITE
-;;;; (RFC 3261 sections 9, 13, 14, 15; race handling per RFC 5407)
+;;;; Sessions: INVITE, ACK, CANCEL, BYE, re-INVITE, UPDATE
+;;;; (RFC 3261 sections 9, 13, 14, 15; race handling per RFC 5407; RFC 3311)
 
 (defclass call ()
   ((ua :initarg :ua :reader call-ua)
@@ -17,8 +17,10 @@
    (on-event :initarg :on-event :initform nil :accessor call-on-event
              :documentation "(lambda (call event &key ...)).  Events:
 :progress (:status :sdp :response), :ringing (:response),
-:established (:sdp), :reinvite (:sdp), :reinvite-accepted (:sdp),
-:reinvite-rejected (:status), :terminated (:cause :status :response).")
+:established (:sdp), :reinvite (:sdp :request; also for an UPDATE carrying an
+offer), :reinvite-accepted (:sdp), :reinvite-rejected (:status),
+:update-accepted (:sdp), :update-rejected (:status),
+:terminated (:cause :status :response).")
    (local-sdp :initarg :local-sdp :initform nil :accessor call-local-sdp)
    (remote-sdp :initarg :remote-sdp :initform nil :accessor call-remote-sdp)
    (cause :initform nil :accessor call-cause)
@@ -93,7 +95,8 @@ the offer from the 2xx, returns the answer to put in the ACK.")
 
 ;;;; UAC side (section 13.2)
 
-(defun invite (ua target &key to from sdp headers on-event answer-function user-data)
+(defun invite (ua target &key to from sdp headers on-event answer-function user-data
+                           (auto-answer-reinvite t))
   "Call TARGET (a SIP URI or string), offering the session description SDP
 (a string).  TO is the logical recipient when it differs from TARGET, as it
 does when calling a registered contact directly; FROM is the caller when
@@ -105,7 +108,8 @@ through ON-EVENT."
            (call (make-instance 'call :ua ua :direction :outgoing :state :calling
                                       :on-event on-event :local-sdp sdp
                                       :answer-function answer-function
-                                      :user-data user-data :invite request)))
+                                      :user-data user-data :invite request
+                                      :auto-answer-reinvite auto-answer-reinvite)))
       (loop for (name value) in (session-headers ua request sdp)
             do (add-header request name value))
       (setf (call-creq call)
@@ -368,7 +372,13 @@ description."
                (call-local-sdp call) sdp)
          (when (sdp-body request)
            (setf (call-remote-sdp call) (sdp-body request)))
-         (call-send-2xx call tx request sdp)))
+         (if (string= (request-method request) "UPDATE")
+             ;; RFC 3311 section 5.2: an ordinary response, with no ACK to
+             ;; wait for.
+             (ua-respond (call-ua call) tx request 200
+                         :headers (session-headers (call-ua call) request sdp)
+                         :body sdp)
+             (call-send-2xx call tx request sdp))))
       ((and (eq (call-direction call) :incoming)
             (member (call-state call) '(:incoming :ringing)))
        (call-ensure-uas-dialog call :confirmed)
@@ -442,6 +452,8 @@ into the response: a challenge with 401, a Reason, a Retry-After."
        (call-terminate call :remote-hangup))
       ((string= method "INVITE")
        (call-handle-reinvite call request tx))
+      ((string= method "UPDATE")
+       (call-handle-update call request tx))
       ((string= method "OPTIONS")
        (ua-handle-options ua request tx))
       (t
@@ -484,6 +496,68 @@ CANCEL or BYE: a Reason saying why, for instance (RFC 3326)."
       (:incoming (reject call 486))
       ((:answered :established)
        (call-send-bye call :local-hangup)))
+    call))
+
+;;; UPDATE (RFC 3311)
+
+(defun call-handle-update (call request tx)
+  "RFC 3311 section 5.2.  Without a session description an UPDATE only
+refreshes the dialog (its target, and session timers where those are used).
+With one it is an offer, handled as a re-INVITE's would be and answered in
+the 200."
+  (let ((ua (call-ua call)))
+    (cond
+      ((null (sdp-body request))
+       (dialog-refresh-target (call-dialog call) request)
+       (ua-respond ua tx request 200
+                   :headers `(("Contact" ,(ua-contact-for ua request))
+                              ("Allow" ,(ua-allow-header ua)))))
+      ((call-reinvite-creq call)
+       ;; Our own offer is outstanding.
+       (ua-respond ua tx request 491))
+      ((or (call-reinvite-tx call) (not (eq (call-state call) :established)))
+       ;; An offer of theirs is unanswered, or the first exchange is not over.
+       (ua-respond ua tx request 500 :headers `(("Retry-After" ,(random 10)))))
+      (t
+       (dialog-refresh-target (call-dialog call) request)
+       (setf (call-reinvite-tx call) tx
+             (call-reinvite-request call) request)
+       (call-fire call :reinvite :sdp (sdp-body request) :request request)
+       (when (and (eq (call-reinvite-tx call) tx)
+                  (call-auto-answer-reinvite call))
+         (answer call))))))
+
+(defun update (call &key sdp)
+  "Send an UPDATE inside CALL's dialog: a refresh, or with SDP a new offer
+that does not need the three-way handshake of a re-INVITE.  The outcome
+arrives as an :update-accepted or :update-rejected event."
+  (on-loop ((call-scheduler call))
+    (when (and (call-dialog call)
+               (not (member (call-state call) '(:terminating :terminated)))
+               (or (null sdp)
+                   (and (eq (call-state call) :established)
+                        (null (call-reinvite-creq call))
+                        (null (call-reinvite-tx call)))))
+      (let ((request (call-make-request call "UPDATE" :body sdp)))
+        (loop for (name value) in (session-headers (call-ua call) request sdp)
+              do (add-header request name value))
+        (ua-send (call-ua call) request
+                 (lambda (creq event argument)
+                   (declare (ignore creq))
+                   (let ((status (and (eq event :response) (response-status argument))))
+                     (cond ((call-terminated-p call))
+                           ((and status (< status 200)))
+                           ((and status (< status 300))
+                            (dialog-refresh-target (call-dialog call) argument)
+                            (when sdp (setf (call-local-sdp call) sdp))
+                            (when (sdp-body argument)
+                              (setf (call-remote-sdp call) (sdp-body argument)))
+                            (call-fire call :update-accepted :sdp (sdp-body argument)
+                                                             :response argument))
+                           (t
+                            (call-fire call :update-rejected :status status
+                                                             :response argument)))))
+                 :dialog (call-dialog call))))
     call))
 
 ;;; re-INVITE (section 14)

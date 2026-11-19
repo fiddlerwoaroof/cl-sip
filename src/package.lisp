@@ -90,7 +90,7 @@
    #:registrar-authenticate #:registrar-make-challenge
 
    ;; calls
-   #:call #:invite #:ring #:answer #:reject #:hangup #:reinvite
+   #:call #:invite #:ring #:answer #:reject #:hangup #:reinvite #:update
    #:call-state #:call-direction #:call-dialog #:call-invite #:call-on-event
    #:call-local-sdp #:call-remote-sdp #:call-cause #:call-status
    #:call-user-data #:call-ua #:call-auto-answer-reinvite))

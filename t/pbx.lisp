@@ -165,7 +165,7 @@ the end together with SERVER."
             (rtp:rtp-session-remote-port (desk-session desk)) port))
     (sdp:sdp-string answer)))
 
-(defun attend (ua &key (after 0) status codecs early)
+(defun attend (ua &key (after 0) status codecs early on-event)
   "Make UA behave like a phone on a desk: it rings, and after AFTER seconds
 answers (never, when AFTER is NIL).  With STATUS it refuses instead.  With
 EARLY it sends a 183 with a session description before ringing on.  Returns
@@ -174,6 +174,7 @@ the DESK, which records the calls and the audio received."
     (setf (sip:ua-on-incoming-call ua)
           (lambda (call)
             (push call (desk-calls desk))
+            (when on-event (setf (sip:call-on-event call) on-event))
             (cond
               (status (sip:reject call status))
               (t
@@ -419,6 +420,68 @@ as a session description arrives."
         (is-true (hears caller 10))
         (sip:hangup call)
         (is-true (wait-for-call call :terminated))))))
+
+(defun audio-direction (sdp-text)
+  (let ((session (sdp:parse-sdp sdp-text)))
+    (sdp:media-direction (first (sdp:session-media session)) session)))
+
+(test hold-and-resume-rfc5359-2.1
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (multiple-value-bind (on-alice alice-events) (recorder)
+      (multiple-value-bind (on-bob bob-events) (recorder)
+        (let* ((caller (open-desk alice))
+               (callee (attend bob :on-event on-bob))
+               (call (dial caller server "101" :on-event on-alice)))
+          (is-true (wait-for-call call :established))
+          (is-true (wait-for-call (desk-call callee) :established))
+          (say caller 3)
+          (is-true (hears callee 3))
+          (flet ((last-event (events name)
+                   (find name (reverse (funcall events)) :key #'car))
+                 (count-events (events name)
+                   (count name (funcall events) :key #'car)))
+            ;; Alice puts the call on hold: her offer says she only sends.
+            (sip:reinvite call :sdp (sdp:sdp-string
+                                     (sdp:hold (sdp:parse-sdp (sip:call-local-sdp call)))))
+            (is-true (sip:wait-until (lambda () (last-event alice-events :reinvite-accepted))))
+            ;; The server answers that it only receives (RFC 3264 section 6.1),
+            (is (eq :recvonly
+                    (audio-direction (getf (cdr (last-event alice-events :reinvite-accepted))
+                                           :sdp))))
+            ;; and tells Bob's phone the call is held.
+            (is-true (sip:wait-until (lambda () (last-event bob-events :reinvite))))
+            (is (eq :sendonly
+                    (audio-direction (getf (cdr (last-event bob-events :reinvite)) :sdp))))
+            ;; Nothing is relayed meanwhile, in either direction.
+            (say caller 5)
+            (say callee 5)
+            (sleep 1/4)
+            (is (= 3 (desk-count callee)))
+            (is (zerop (desk-count caller)))
+            ;; Resume.
+            (sip:reinvite call :sdp (sdp:sdp-string
+                                     (sdp:resume (sdp:parse-sdp (sip:call-local-sdp call)))))
+            (is-true (sip:wait-until
+                      (lambda () (= 2 (count-events alice-events :reinvite-accepted)))))
+            (is (eq :sendrecv
+                    (audio-direction (getf (cdr (last-event alice-events :reinvite-accepted))
+                                           :sdp))))
+            (is-true (sip:wait-until (lambda () (= 2 (count-events bob-events :reinvite)))))
+            (is (eq :sendrecv
+                    (audio-direction (getf (cdr (last-event bob-events :reinvite)) :sdp))))
+            (say caller 4)
+            (is-true (hears callee 7))
+            (say callee 2)
+            (is-true (hears caller 2))
+            ;; An UPDATE with an offer is answered the same way (RFC 3311).
+            (sip:update call :sdp (sdp:sdp-string
+                                   (sdp:bump-version (sdp:parse-sdp (sip:call-local-sdp call)))))
+            (is-true (sip:wait-until (lambda () (last-event alice-events :update-accepted))))
+            (is (eq :sendrecv
+                    (audio-direction (getf (cdr (last-event alice-events :update-accepted))
+                                           :sdp)))))
+          (sip:hangup call)
+          (is-true (wait-for-call call :terminated)))))))
 
 (test rtp-forwarding
   ;; The relay keeps a stream's shape: gaps and markers pass through, on the

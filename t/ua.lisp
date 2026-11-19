@@ -170,7 +170,8 @@
       (sip:options alice *bob* :on-response (lambda (r) (setf response r)))
       (settle world)
       (is (= 200 (sip:response-status response)))
-      (is (equal '("INVITE" "ACK" "BYE" "CANCEL" "OPTIONS") (sip:header-values response "Allow")))
+      (is (equal '("INVITE" "ACK" "BYE" "CANCEL" "OPTIONS" "UPDATE")
+                 (sip:header-values response "Allow")))
       (is (string= "application/sdp" (sip:header response "Accept")))
       (is (sip:msg-to-tag response))
       (let ((request (first (wire-messages world "OPTIONS"))))
@@ -625,6 +626,47 @@
         (is (eq :established (sip:call-state call)))
         (is (eq :established (sip:call-state (funcall incoming))))
         (is (string= *answer* (sip:call-local-sdp (funcall incoming))))))))
+
+(test update-rfc3311
+  (multiple-value-bind (world alice bob incoming bob-events) (call-pair :on-incoming :answer)
+    (declare (ignorable bob))
+    (multiple-value-bind (on-event events) (recorder)
+      (let ((call (sip:invite alice *bob* :sdp *offer* :on-event on-event))
+            (new-offer (substitute #\9 #\1 *offer*)))
+        (settle world)
+        (clear-wire world)
+        ;; Without a description: a refresh, answered at once.
+        (sip:update call)
+        (settle world)
+        (is (equal '("UPDATE" "200/UPDATE") (wire world)))
+        (is (member "UPDATE" (sip:header-values (first (wire-messages world 200)) "Allow")
+                    :test #'string=))
+        (is (eq :update-accepted (car (first (last (funcall events))))))
+        (is (null (getf (cdr (first (last (funcall events)))) :sdp)))
+        ;; With one: an offer, answered in the 200, with no ACK to follow.
+        (clear-wire world)
+        (sip:update call :sdp new-offer)
+        (settle world)
+        (tick world 40)
+        (is (equal '("UPDATE" "200/UPDATE") (wire world)))
+        (is (eq :reinvite (car (first (last (funcall bob-events))))))
+        (is (string= new-offer (sip:call-remote-sdp (funcall incoming))))
+        (is (string= new-offer (sip:call-local-sdp call)))
+        (is (string= *answer* (getf (cdr (first (last (funcall events)))) :sdp)))
+        ;; The other side may do the same.
+        (clear-wire world)
+        (sip:update (funcall incoming) :sdp *answer*)
+        (settle world)
+        (is (equal '("UPDATE" "200/UPDATE") (wire world)))
+        ;; An offer while one of ours is outstanding is refused (section 5.2).
+        (clear-wire world)
+        (sip:reinvite call :sdp *offer*)
+        (sip:update (funcall incoming) :sdp *answer*)
+        (settle world)
+        (is (equal '(:established) (remove-duplicates
+                                    (list (sip:call-state call)
+                                          (sip:call-state (funcall incoming))))))
+        (is-true (wire-messages world 491))))))
 
 (test reinvite-glare-14.1
   (multiple-value-bind (world alice bob incoming) (call-pair :on-incoming :answer)
