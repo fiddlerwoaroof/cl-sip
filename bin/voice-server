@@ -6,6 +6,10 @@
 # Needs ANTHROPIC_API_KEY, and whisper-cli, curl and WHISPER_MODEL from the
 # flake's dev shell.  VOICE_HOST and VOICE_PORT override 127.0.0.1:5060;
 # use VOICE_HOST=0.0.0.0 to accept phones on the local network.
+#
+# VOICE_TTS=chatterbox speaks with the Chatterbox Turbo model (needs uv)
+# instead of the macOS `say` command, and VOICE_REFERENCE=clip.wav makes it
+# imitate the voice in that recording.
 cd "$(dirname "$0")/.." || exit 1
 if [ -z "$ANTHROPIC_API_KEY" ]; then
   echo "warning: ANTHROPIC_API_KEY is not set; the agent will not be able to answer" >&2
@@ -17,5 +21,12 @@ exec sbcl --noinform \
   --eval '(ql:quickload "cl-sip/voice" :silent t)' \
   --eval '(cl-sip.voice:start-server
            :host (or (uiop:getenv "VOICE_HOST") "127.0.0.1")
-           :port (parse-integer (or (uiop:getenv "VOICE_PORT") "5060")))' \
+           :port (parse-integer (or (uiop:getenv "VOICE_PORT") "5060"))
+           :tts (if (equal (uiop:getenv "VOICE_TTS") "chatterbox")
+                    (progn
+                      (format t "~&loading the Chatterbox model...~%")
+                      (finish-output)
+                      (cl-sip.voice:make-chatterbox-tts
+                       :voice (uiop:getenvp "VOICE_REFERENCE")))
+                    (cl-sip.voice:make-say-tts)))' \
   --eval '(loop (sleep 3600))'

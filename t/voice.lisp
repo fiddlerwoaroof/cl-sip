@@ -98,6 +98,37 @@
     (is (eq :agent (voice::dialplan-action plan "alice")))
     (is (null (voice::dialplan-action '(("600" :echo)) "601")))))
 
+(test worker-tts-protocol
+  ;; A stand-in worker: announces readiness, then writes the same WAV for
+  ;; every request, failing when asked to say "fail".
+  (uiop:with-temporary-file (:pathname sample :type "wav" :keep t)
+    (voice:write-wav sample (tone 2400) 24000)
+    (uiop:with-temporary-file (:pathname script :type "sh" :keep t)
+      (with-open-file (out script :direction :output :if-exists :supersede)
+        (format out "#!/bin/sh
+echo 'loading noise that is not JSON'
+echo '{\"ready\": true}'
+while read -r line; do
+  case \"$line\" in
+    *fail*) echo '{\"ok\": false, \"error\": \"no voice\"}' ;;
+    *) out=$(printf '%s' \"$line\" | sed 's/.*\"out\":\"\\([^\"]*\\)\".*/\\1/')
+       cp '~a' \"$out\"; echo '{\"ok\": true}' ;;
+  esac
+done
+" (namestring sample)))
+      (let ((tts (voice:make-worker-tts (list "sh" (namestring script)))))
+        (unwind-protect
+             (progn
+               ;; 24 kHz output is brought down to the telephone rate.
+               (is (= 800 (length (voice:synthesize tts "Hello there."))))
+               (is (= 800 (length (voice:synthesize tts "Again."))))
+               (signals error (voice:synthesize tts "please fail"))
+               ;; The worker survives a failed request.
+               (is (= 800 (length (voice:synthesize tts "Still here.")))))
+          (voice:stop-backend tts)
+          (delete-file script)
+          (delete-file sample))))))
+
 ;;; The Claude backend, against a stand-in for curl that replays a stream.
 
 (defun fake-curl (output)

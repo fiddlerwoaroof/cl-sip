@@ -128,14 +128,36 @@ device on your network, start it with `VOICE_HOST=0.0.0.0`; there is no
 authentication on calls, so keep it off untrusted networks.
 
 Each stage is replaceable: `start-server` takes `:stt`, `:llm` and `:tts`
-objects. `make-claude-llm` accepts `:model`, `:system` and `:effort`;
-`make-say-tts` accepts `:voice`; and `make-command-tts` runs any program
-that writes a WAV file, which is the hook for a local voice-cloning model:
+objects. `make-claude-llm` accepts `:model`, `:system` and `:effort`, and
+`make-say-tts` accepts `:voice`.
+
+### A cloned voice
+
+`make-chatterbox-tts` speaks with the Chatterbox Turbo model, which can
+imitate a voice from a short reference recording (about ten seconds of clean
+speech). It runs `tools/chatterbox_tts.py` under `uv` as a worker that keeps
+the model loaded; the first start downloads the model (4 GB) unless it is
+already in the Hugging Face cache.
+
+```sh
+VOICE_TTS=chatterbox VOICE_REFERENCE=me.wav direnv exec . bin/voice-server
+```
 
 ```lisp
 (cl-sip.voice:start-server
- :tts (cl-sip.voice:make-command-tts
-       '("my-tts" "--voice" "me.wav" "--text" :text "--out" :output)))
+ :tts (cl-sip.voice:make-chatterbox-tts :voice "me.wav"))
+```
+
+On an Apple Silicon laptop it takes about as long to synthesize a sentence
+as to speak it, so replies start two to three seconds later than with `say`,
+and loading takes around half a minute.
+
+Other models plug in the same way: `make-worker-tts` runs any long-lived
+program that speaks the worker's line protocol (see the script's header),
+and `make-command-tts` runs a program once per sentence:
+
+```lisp
+(cl-sip.voice:make-command-tts '("my-tts" "--text" :text "--out" :output))
 ```
 
 ## Layout

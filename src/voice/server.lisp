@@ -216,5 +216,7 @@ the local network."
     server))
 
 (defun stop-server (server)
+  "Stop listening and shut down any worker processes the backends run."
   (sip:stop (server-ua server))
+  (mapc #'stop-backend (list (server-stt server) (server-llm server) (server-tts server)))
   server)

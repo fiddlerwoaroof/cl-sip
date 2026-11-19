@@ -13,6 +13,7 @@
    #:transcribe #:synthesize #:respond #:abort-response
    #:whisper-stt #:make-whisper-stt
    #:say-tts #:make-say-tts #:command-tts #:make-command-tts
+   #:worker-tts #:make-worker-tts #:make-chatterbox-tts #:stop-backend
    #:claude-llm #:make-claude-llm #:function-llm #:make-function-llm
    #:function-stt #:make-function-stt #:function-tts #:make-function-tts
    #:llm-error #:*phone-system-prompt*

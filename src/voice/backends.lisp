@@ -125,6 +125,70 @@ speak and :OUTPUT by the path of the WAV file the program must write."
     (multiple-value-bind (samples rate) (read-wav wav)
       (resample samples rate 8000))))
 
+;;; Text to speech: a long-running worker process, so that a large model is
+;;; loaded once rather than for every sentence
+
+(defclass worker-tts ()
+  ((command :initarg :command)
+   (process :initform nil)
+   (lock :initform (bt:make-lock "worker-tts"))))
+
+(defun worker-read-reply (process)
+  "Next JSON line from the worker; other output is skipped."
+  (loop for line = (read-line (uiop:process-info-output process) nil nil)
+        do (cond ((null line) (error "The speech worker exited unexpectedly."))
+                 ((alexandria:starts-with-subseq "{" line) (return (jzon:parse line))))))
+
+(defun make-worker-tts (command)
+  "Speak through a worker process started with COMMAND (a list of strings)
+and kept running.  The worker announces itself with a JSON line containing
+\"ready\", then answers each request line {\"text\": ..., \"out\": path} by
+writing a WAV file to that path and replying {\"ok\": true}.  Blocks until
+the worker is ready."
+  (let ((tts (make-instance 'worker-tts :command command)))
+    (with-slots (process) tts
+      (setf process (uiop:launch-program command :input :stream :output :stream
+                                                 :error-output nil))
+      (unless (gethash "ready" (worker-read-reply process))
+        (error "The speech worker did not start: ~s" command)))
+    tts))
+
+(defun make-chatterbox-tts (&key voice script)
+  "Speak with the Chatterbox Turbo model through tools/chatterbox_tts.py,
+run by uv.  VOICE is a reference recording of the voice to imitate; without
+it the model's built-in voice is used.  Loading takes around half a minute."
+  (make-worker-tts
+   `("uv" "run" "--quiet"
+          ,(namestring (or script
+                           (asdf:system-relative-pathname "cl-sip" "tools/chatterbox_tts.py")))
+          ,@(when voice (list "--voice" (namestring voice))))))
+
+(defmethod synthesize ((tts worker-tts) text)
+  (with-slots (process lock) tts
+    (uiop:with-temporary-file (:pathname wav :type "wav")
+      (bt:with-lock-held (lock)
+        (let ((input (uiop:process-info-input process)))
+          (write-line (jzon:stringify (json-object "text" text "out" (namestring wav)))
+                      input)
+          (finish-output input))
+        (let ((reply (worker-read-reply process)))
+          (unless (eq (gethash "ok" reply) t)
+            (error "Speech synthesis failed: ~a" (gethash "error" reply)))))
+      (multiple-value-bind (samples rate) (read-wav wav)
+        (resample samples rate 8000)))))
+
+(defgeneric stop-backend (backend)
+  (:documentation "Release whatever BACKEND holds (worker processes).")
+  (:method (backend) (declare (ignore backend)) nil))
+
+(defmethod stop-backend ((tts worker-tts))
+  (with-slots (process) tts
+    (when process
+      (ignore-errors (close (uiop:process-info-input process)))
+      (ignore-errors (uiop:terminate-process process))
+      (ignore-errors (uiop:wait-process process))
+      (setf process nil))))
+
 ;;; Language model: Claude over the Messages API, streamed
 
 (define-condition llm-error (error)

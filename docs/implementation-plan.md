@@ -568,7 +568,10 @@ softphone ──SIP──▶ phone server (registrar + dialplan) ──▶ voice
   effort is `low` to keep the first word quick. The API key is passed to
   curl on standard input, not on the command line. There is no realtime
   speech API for Claude, hence the pipeline.
+- **Cloned voices:** `make-chatterbox-tts` drives Chatterbox Turbo through
+  a Python worker (`tools/chatterbox_tts.py`, run by `uv`) that loads the
+  model once and takes one request per line; a reference recording sets the
+  voice.
 - **Not done yet:** calls between two registered phones (needs a
-  back-to-back UA with an RTP relay), DTMF input, a voice-cloning TTS
-  backend (the `command-tts` hook is there for one), and conversation
-  length limits.
+  back-to-back UA with an RTP relay), DTMF input, and conversation length
+  limits.
