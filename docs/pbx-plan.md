@@ -159,7 +159,7 @@ Updated as phases land.
 
 | Phase | State |
 |---|---|
-| 1 Directory and authentication | planned |
+| 1 Directory and authentication | done |
 | 2 Bridged calls | planned |
 | 3 Changes during a call | planned |
 | 4 Forwarding | planned |

@@ -239,6 +239,10 @@ arrives as a :bindings event."
    (users :initarg :users :initform nil :accessor registrar-users
           :documentation "Alist (username . password).  NIL disables authentication.")
    (algorithm :initarg :algorithm :initform "MD5" :accessor registrar-algorithm)
+   (strict :initarg :strict :initform nil :accessor registrar-strict
+           :documentation "When true, a user may only register its own name: the
+user part of the To header must be the authenticated user name (section 10.3,
+step 4).")
    (min-expires :initarg :min-expires :initform 60 :accessor registrar-min-expires)
    (default-expires :initarg :default-expires :initform 3600
                     :accessor registrar-default-expires)
@@ -246,8 +250,8 @@ arrives as a :bindings event."
    (nonces :initform (make-hash-table :test #'equal) :reader registrar-nonces)))
 
 (defun make-registrar (&rest args &key realm users algorithm min-expires
-                                    default-expires max-expires)
-  (declare (ignore realm users algorithm min-expires default-expires max-expires))
+                                    default-expires max-expires strict)
+  (declare (ignore realm users algorithm min-expires default-expires max-expires strict))
   (apply #'make-instance 'registrar args))
 
 (defun aor-key (uri)
@@ -264,39 +268,72 @@ arrives as a :bindings event."
           (registrar-live-bindings registrar (aor-key (ensure-uri aor))
                                    (now (ua-scheduler ua)))))
 
-(defun registrar-challenge (registrar ua request tx &key stale)
+(defun registrar-lookup-user (registrar ua user)
+  "Contact URIs registered for USER under any domain: a phone may name the
+server by address or by any of its host names."
+  (let ((prefix (format nil "~(~a~)@" user))
+        (now (now (ua-scheduler ua)))
+        (contacts '()))
+    (loop for key in (alexandria:hash-table-keys (registrar-bindings registrar))
+          when (alexandria:starts-with-subseq prefix key)
+            do (dolist (b (registrar-live-bindings registrar key now))
+                 (pushnew (name-addr-uri (binding-contact b)) contacts :test #'uri-equal)))
+    (nreverse contacts)))
+
+(defun registrar-make-challenge (registrar &key stale)
+  "A fresh digest challenge, as a WWW-Authenticate header value."
   (let ((challenge (generate-challenge (registrar-realm registrar)
                                        :algorithm (registrar-algorithm registrar)
                                        :stale stale)))
     (setf (gethash (challenge-nonce challenge) (registrar-nonces registrar)) t)
-    (ua-respond ua tx request 401
-                :headers `(("WWW-Authenticate" ,(format-challenge challenge))))))
+    (format-challenge challenge)))
+
+(defun registrar-authenticate (registrar request)
+  "The user name REQUEST proves it holds the password of, by digest
+credentials for this registrar's realm; or NIL and why: :MISSING, :STALE
+(the nonce is not one of ours any more) or :BAD."
+  (let* ((credentials
+           (find (registrar-realm registrar)
+                 (loop for raw in (header-values request "Authorization")
+                       for c = (ignore-errors (parse-credentials raw))
+                       when c collect c)
+                 :key #'credentials-realm :test #'equal))
+         (password (and credentials
+                        (cdr (assoc (credentials-username credentials)
+                                    (registrar-users registrar) :test #'equal)))))
+    (cond ((null credentials) (values nil :missing))
+          ((not (gethash (credentials-nonce credentials) (registrar-nonces registrar)))
+           (values nil :stale))
+          ((and password
+                (verify-credentials credentials :password password
+                                                :method (request-method request)
+                                                :body (message-body request)))
+           (credentials-username credentials))
+          (t (values nil :bad)))))
 
 (defun registrar-authorized-p (registrar ua request tx)
-  "True when REQUEST may proceed; otherwise a 401 has been sent."
+  "True (the user name, when there are users) when REQUEST may proceed;
+otherwise a 401 has been sent."
   (or (null (registrar-users registrar))
-      (let* ((credentials
-               (find (registrar-realm registrar)
-                     (loop for raw in (header-values request "Authorization")
-                           for c = (ignore-errors (parse-credentials raw))
-                           when c collect c)
-                     :key #'credentials-realm :test #'equal))
-             (password (and credentials
-                            (cdr (assoc (credentials-username credentials)
-                                        (registrar-users registrar) :test #'equal)))))
-        (cond ((null credentials)
-               (registrar-challenge registrar ua request tx) nil)
-              ((not (gethash (credentials-nonce credentials) (registrar-nonces registrar)))
-               (registrar-challenge registrar ua request tx :stale t) nil)
-              ((and password
-                    (verify-credentials credentials :password password
-                                                    :method (request-method request)
-                                                    :body (message-body request)))
-               t)
-              (t (registrar-challenge registrar ua request tx) nil)))))
+      (multiple-value-bind (user problem) (registrar-authenticate registrar request)
+        (or user
+            (progn
+              (ua-respond ua tx request 401
+                          :headers `(("WWW-Authenticate"
+                                      ,(registrar-make-challenge
+                                        registrar :stale (eq problem :stale)))))
+              nil)))))
 
 (defun registrar-handle-register (registrar ua request tx)
-  (when (registrar-authorized-p registrar ua request tx)
+  (let ((user (registrar-authorized-p registrar ua request tx)))
+    (cond ((null user))
+          ((and (registrar-strict registrar) (stringp user)
+                (not (equalp user (sip-uri-user (name-addr-uri (msg-to request))))))
+           (ua-respond ua tx request 403))
+          (t (registrar-update-bindings registrar ua request tx)))))
+
+(defun registrar-update-bindings (registrar ua request tx)
+  (progn
     (let* ((now (now (ua-scheduler ua)))
            (key (aor-key (name-addr-uri (msg-to request))))
            (current (registrar-live-bindings registrar key now))
@@ -305,7 +342,7 @@ arrives as a :bindings event."
            (call-id (msg-call-id request))
            (cseq (cseq-number (msg-cseq request))))
       (flet ((fail (status &rest headers)
-               (return-from registrar-handle-register
+               (return-from registrar-update-bindings
                  (ua-respond ua tx request status :headers headers)))
              (out-of-order-p (binding)
                (and (equal (binding-call-id binding) call-id)

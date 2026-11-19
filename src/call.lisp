@@ -371,9 +371,10 @@ description."
        (call-send-2xx call (call-server-tx call) (call-invite call) sdp)))
     call))
 
-(defun reject (call &optional status)
+(defun reject (call &optional status headers)
   "Refuse an incoming call (486 Busy Here by default) or a pending re-INVITE
-(488 Not Acceptable Here by default)."
+(488 Not Acceptable Here by default).  HEADERS, a list of (name value), go
+into the response: a challenge with 401, a Reason, a Retry-After."
   (on-loop ((call-scheduler call))
     (cond
       ((call-reinvite-tx call)
@@ -381,11 +382,11 @@ description."
              (request (call-reinvite-request call)))
          (setf (call-reinvite-tx call) nil
                (call-reinvite-request call) nil)
-         (ua-respond (call-ua call) tx request (or status 488))))
+         (ua-respond (call-ua call) tx request (or status 488) :headers headers)))
       ((and (eq (call-direction call) :incoming)
             (member (call-state call) '(:incoming :ringing)))
        (ua-respond (call-ua call) (call-server-tx call) (call-invite call)
-                   (or status 486) :to-tag (call-local-tag call))
+                   (or status 486) :to-tag (call-local-tag call) :headers headers)
        (call-terminate call :local-reject :status (or status 486))))
     call))
 

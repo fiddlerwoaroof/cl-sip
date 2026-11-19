@@ -48,6 +48,7 @@
      (:file "tools")
      (:file "backends")
      (:file "agent")
+     (:file "extensions")
      (:file "server")))))
 
 (defsystem "cl-sip/examples"
@@ -80,6 +81,7 @@
      (:file "sdp")
      (:file "rtp")
      (:file "sockets")
-     (:file "voice"))))
+     (:file "voice")
+     (:file "pbx"))))
   :perform (test-op (o c) (unless (symbol-call :cl-sip.test :run-all)
                             (error "cl-sip tests failed"))))

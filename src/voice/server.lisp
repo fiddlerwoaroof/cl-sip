@@ -30,6 +30,13 @@ this machine itself.")
                     :accessor server-allowed-callers
                     :documentation "Caller numbers accepted from the trunk; NIL
 accepts any.")
+   (extensions :initarg :extensions :initform '() :accessor server-extensions
+               :documentation "The extension list (see extensions.lisp).  When
+there is one, only its extensions may register, and phones must authenticate
+their calls.")
+   (ring-seconds :initarg :ring-seconds :initform 30 :accessor server-ring-seconds
+                 :documentation "How long an extension rings before the call counts
+as unanswered.")
    (max-calls :initarg :max-calls :initform 2 :accessor server-max-calls
               :documentation "Agent calls allowed at once.")
    (active-calls :initform 0 :accessor server-active-calls)
@@ -128,8 +135,31 @@ without an answer, so scanners learn nothing."
 calls to our registered contact, so the number called is in the To header."
   (let ((invite (sip:call-invite call)))
     (if (eq (call-kind server call) :trunk)
-        (string-left-trim "+" (uri-user (sip:name-addr-uri (sip:msg-to invite))))
-        (uri-user (sip:request-uri invite)))))
+        (normalize-number (uri-user (sip:name-addr-uri (sip:msg-to invite))))
+        (normalize-number (uri-user (sip:request-uri invite))))))
+
+(defun call-caller-extension (call)
+  "The extension that placed CALL, once it has authenticated."
+  (getf (sip:call-user-data call) :caller))
+
+(defun server-authenticate-call (server call)
+  "The extension placing CALL, proven by digest credentials.  Without them
+the call is refused with a challenge and NIL is returned; the phone then
+sends the INVITE again with credentials."
+  (let ((registrar (sip:ua-registrar (server-ua server))))
+    (multiple-value-bind (user problem)
+        (sip:registrar-authenticate registrar (sip:call-invite call))
+      (let ((extension (and user (find-extension (server-extensions server) user))))
+        (cond (extension
+               (setf (getf (sip:call-user-data call) :caller) extension))
+              (t
+               (when (eq problem :bad)
+                 (server-log server "wrong password in a call from ~a" (call-caller call)))
+               (sip:reject call 401
+                           `(("WWW-Authenticate"
+                              ,(sip:registrar-make-challenge
+                                registrar :stale (eq problem :stale)))))
+               nil))))))
 
 (defun call-caller (call)
   (let ((from (sip:msg-from (sip:call-invite call))))
@@ -239,11 +269,18 @@ NIL after rejecting the call."
     (t (lambda ()))))
 
 (defun server-handle-call (server call)
+  (when (and (server-extensions server)
+             (eq (call-kind server call) :local)
+             (not (server-authenticate-call server call)))
+    (return-from server-handle-call))
   (let* ((kind (call-kind server call))
          (extension (call-extension server call))
          (action (dialplan-action (server-dialplan server) extension))
          (agent (eq action :agent)))
-    (server-log server "~(~a~) call from ~a to ~s -> ~s" kind (call-caller call) extension
+    (server-log server "~(~a~) call from ~a to ~s -> ~s" kind
+                (let ((caller (call-caller-extension call)))
+                  (if caller (extension-label caller) (call-caller call)))
+                extension
                 (if (functionp action) :function action))
     (when (eq kind :trunk)
       ;; Worth seeing while a trunk is being set up: how the number arrives.
@@ -315,12 +352,18 @@ NIL after rejecting the call."
                        (stt (make-whisper-stt)) (llm (make-claude-llm)) (tts (make-say-tts))
                        (greeting "Hello! What can I do for you?")
                        (barge-in t) (tcp t) (log-stream *standard-output*)
-                       trunk allow allowed-callers (max-calls 2) rtp-port-range stun)
+                       trunk allow allowed-callers (max-calls 2) rtp-port-range stun
+                       extensions (ring-seconds 30))
   "Start a phone server on HOST:PORT (UDP, and TCP unless TCP is NIL).
 
 Softphones may register with any user name; with USERS, an alist of
 (name . password), registration requires digest authentication.  Calls are
-routed by DIALPLAN (see *DEFAULT-DIALPLAN*).  Only this machine may register
+routed by DIALPLAN (see *DEFAULT-DIALPLAN*).
+
+EXTENSIONS is the extension list, as forms (see PARSE-EXTENSION) or as
+LOAD-EXTENSIONS returns it.  With one, only those extensions may register,
+each under its own number and password, and a phone's calls must carry the
+same credentials.  Only this machine may register
 and call unless ALLOW lists further networks, e.g. (\"192.168.1.0/24\"), in
 which case HOST must be \"0.0.0.0\" or an address on that network.
 
@@ -335,7 +378,13 @@ called, limited to ALLOWED-CALLERS when given, and to MAX-CALLS agent calls
 at once.  For their audio to arrive through a NAT, either forward
 RTP-PORT-RANGE, a (low . high) pair of UDP ports, to this machine, or name
 a STUN server (\"host:port\")."
-  (let* ((trunk-user (getf trunk :username))
+  (let* ((extensions (parse-extensions extensions))
+         (users (or users
+                    (loop for extension in extensions
+                          when (extension-password extension)
+                            collect (cons (extension-number extension)
+                                          (extension-password extension)))))
+         (trunk-user (getf trunk :username))
          (registrar (and trunk (sip:ensure-uri (getf trunk :registrar))))
          (ua (sip:make-user-agent
               :aor (if trunk
@@ -345,7 +394,8 @@ a STUN server (\"host:port\")."
               :transports `((:udp :host ,host :port ,port)
                             ,@(when tcp `((:tcp :host ,host :port ,port))))
               :credentials (when trunk `((nil ,trunk-user ,(getf trunk :password))))
-              :registrar (sip:make-registrar :realm "cl-sip" :users users)
+              :registrar (sip:make-registrar :realm "cl-sip" :users users
+                                             :strict (and extensions t))
               :user-agent-name "cl-sip-voice/0.1"))
          (server (make-instance 'phone-server
                                 :ua ua :host host :dialplan dialplan
@@ -354,6 +404,7 @@ a STUN server (\"host:port\")."
                                 :trunk-ranges (and trunk
                                                    (getf trunk :ranges
                                                          *flowroute-signalling-ranges*))
+                                :extensions extensions :ring-seconds ring-seconds
                                 :allow allow :allowed-callers allowed-callers
                                 :max-calls max-calls :rtp-port-range rtp-port-range
                                 :stun (etypecase stun
@@ -465,6 +516,9 @@ said (names and snippets only; read a page before relying on it):"))
   VOICE_MAX_CALLS               agent calls at once (2)
   VOICE_RTP_PORTS               e.g. 40000-40019, a UDP range forwarded to here
   VOICE_STUN                    STUN server, host:port
+  VOICE_EXTENSIONS              file with the extension list (extensions.lisp
+                                when there is one)
+  VOICE_RING_SECONDS            how long an extension rings (30)
   VOICE_WIKI_TOKEN              capability token for the LLM-wiki MCP server;
                                 setting it lets the agent consult the wiki
   VOICE_WIKI_URL                where that server is (http://localhost:8788/mcp)
@@ -492,6 +546,11 @@ OVERRIDES are START-SERVER keyword arguments that take precedence."
                                        (cons (parse-integer ports :end dash)
                                              (parse-integer ports :start (1+ dash))))
                   :stun (env "VOICE_STUN")
+                  :extensions (let ((path (or (env "VOICE_EXTENSIONS")
+                                              (and (probe-file "extensions.lisp")
+                                                   "extensions.lisp"))))
+                                (and path (load-extensions path)))
+                  :ring-seconds (parse-integer (or (env "VOICE_RING_SECONDS") "30"))
                   :llm (make-claude-llm
                         ;; Room for a few whole pages, and for a second search.
                         :max-tool-result 40000 :max-tool-rounds 6

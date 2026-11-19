@@ -85,8 +85,9 @@
    #:registration-contact
    #:registration-state #:registration-expires #:registration-bindings
    #:registration-last-response #:registration-on-event
-   #:registrar #:make-registrar #:registrar-lookup #:registrar-users
-   #:registrar-realm #:registrar-min-expires
+   #:registrar #:make-registrar #:registrar-lookup #:registrar-lookup-user
+   #:registrar-users #:registrar-realm #:registrar-min-expires #:registrar-strict
+   #:registrar-authenticate #:registrar-make-challenge
 
    ;; calls
    #:call #:invite #:ring #:answer #:reject #:hangup #:reinvite

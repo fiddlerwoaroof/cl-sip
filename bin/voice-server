@@ -25,6 +25,9 @@
 #     VOICE_HOST, VOICE_PORT   listen address (127.0.0.1, or 0.0.0.0 with a
 #                              trunk; port 5060)
 #     VOICE_ALLOW              comma-separated networks whose phones may call
+#     VOICE_EXTENSIONS         file listing the extensions (extensions.lisp when
+#                              present); see docs/pbx-plan.md for the format
+#     VOICE_RING_SECONDS       how long an extension rings (default 30)
 #     VOICE_WIKI_TOKEN         capability token for the LLM-wiki MCP server; with
 #                              it the agent can look things up in the wiki
 #     VOICE_WIKI_URL           that server's address (http://localhost:8788/mcp)
@@ -94,6 +97,19 @@ else bad "WHISPER_MODEL does not name a file (the flake dev shell sets it)"; fi
 echo "Model"
 if is_set ANTHROPIC_API_KEY; then ok "ANTHROPIC_API_KEY is set"
 else bad "ANTHROPIC_API_KEY is not set"; fi
+
+echo "Extensions"
+extensions_file=${VOICE_EXTENSIONS:-}
+if [ -z "$extensions_file" ] && [ -f extensions.lisp ]; then extensions_file=extensions.lisp; fi
+if [ -n "$extensions_file" ]; then
+  if [ -r "$extensions_file" ]; then ok "extension list: $extensions_file"
+  else bad "VOICE_EXTENSIONS names a file that cannot be read"; fi
+else
+  note "no extension list: any phone may register, and every call goes to the dialplan"
+fi
+if is_set VOICE_RING_SECONDS && ! is_int "$VOICE_RING_SECONDS"; then
+  bad "VOICE_RING_SECONDS must be a number"
+fi
 
 echo "Wiki"
 if is_set VOICE_WIKI_TOKEN; then

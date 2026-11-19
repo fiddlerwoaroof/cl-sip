@@ -26,4 +26,8 @@
    ;; server
    #:phone-server #:start-server #:start-server-from-environment #:stop-server
    #:server-ua #:server-port #:server-registration #:*flowroute-signalling-ranges*
-   #:*default-dialplan*))
+   #:*default-dialplan*
+   ;; extensions
+   #:extension #:make-extension #:parse-extensions #:load-extensions #:find-extension
+   #:extension-number #:extension-name #:normalize-number
+   #:server-extensions #:server-ring-seconds))
