@@ -17,14 +17,19 @@
    (packets-sent :initform 0 :accessor rtp-session-packets-sent)
    (packets-received :initform 0 :accessor rtp-session-packets-received)
    (remote-ssrc :initform nil :accessor rtp-session-remote-ssrc)
+   (latch :initarg :latch :initform nil :accessor rtp-session-latch
+          :documentation "When true, send to wherever the peer's packets actually
+come from rather than the address it advertised (symmetric RTP), which is
+what makes media work through a NAT.")
    (socket :initform nil :accessor rtp-session-socket)
    (thread :initform nil :accessor rtp-session-thread)
    (running :initform nil :accessor rtp-session-running)
    (lock :initform (bt:make-lock "rtp-send") :reader rtp-session-lock)))
 
 (defun make-rtp-session (&rest args &key local-host local-port remote-host remote-port
-                                      payload-type ssrc on-packet)
-  (declare (ignore local-host local-port remote-host remote-port payload-type ssrc on-packet))
+                                      payload-type ssrc on-packet latch)
+  (declare (ignore local-host local-port remote-host remote-port payload-type ssrc
+                   on-packet latch))
   (apply #'make-instance 'rtp-session args))
 
 (defun rtp-session-start (session)
@@ -43,12 +48,18 @@ receiving."
                (loop while (rtp-session-running session)
                      do (handler-case
                             (when (usocket:wait-for-input socket :timeout 1/5 :ready-only t)
-                              (multiple-value-bind (data size)
+                              (multiple-value-bind (data size host port)
                                   (usocket:socket-receive socket buffer (length buffer))
                                 (declare (ignore data))
                                 (when (and size (>= size 12))
                                   (let ((packet (decode-rtp-packet buffer :end size)))
                                     (incf (rtp-session-packets-received session))
+                                    (when (and (rtp-session-latch session) host port)
+                                      (setf (rtp-session-remote-host session)
+                                            (if (stringp host)
+                                                host
+                                                (format nil "~{~d~^.~}" (coerce host 'list)))
+                                            (rtp-session-remote-port session) port))
                                     (setf (rtp-session-remote-ssrc session)
                                           (rtp-packet-ssrc packet))
                                     (when (rtp-session-on-packet session)
@@ -60,6 +71,8 @@ receiving."
     session))
 
 (defun rtp-session-stop (session)
+  "Stop receiving and close the socket.  Waits for the receive thread, so
+do not call it from that thread (i.e. from an ON-PACKET callback)."
   (when (rtp-session-running session)
     (setf (rtp-session-running session) nil)
     (bt:join-thread (rtp-session-thread session))
@@ -75,6 +88,13 @@ receiving."
                          :port (rtp-session-remote-port session))
     (incf (rtp-session-packets-sent session))
     packet))
+
+(defun rtp-skip (session samples)
+  "Advance the timestamp by SAMPLES without sending, to account for a gap
+in the stream (silence suppression, RFC 3551 section 4.1)."
+  (bt:with-lock-held ((rtp-session-lock session))
+    (setf (rtp-session-timestamp session)
+          (logand (+ (rtp-session-timestamp session) samples) #xFFFFFFFF))))
 
 (defun rtp-send (session payload &key marker payload-type (samples (length payload)))
   "Send PAYLOAD as the next packet of the stream.  SAMPLES is how far the

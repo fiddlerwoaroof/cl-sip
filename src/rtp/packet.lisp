@@ -20,7 +20,7 @@
    #:rtp-session-local-port #:rtp-session-remote-host #:rtp-session-remote-port
    #:rtp-session-ssrc #:rtp-session-payload-type #:rtp-session-on-packet
    #:rtp-session-packets-sent #:rtp-session-packets-received
-   #:rtp-session-remote-ssrc #:rtp-send #:rtp-send-dtmf))
+   #:rtp-session-remote-ssrc #:rtp-session-latch #:rtp-send #:rtp-skip #:rtp-send-dtmf))
 
 (in-package :cl-sip.rtp)
 
