@@ -120,14 +120,17 @@ the public side of a NAT is given the transport's public address."
 
 ;;;; Building requests outside a dialog (section 8.1.1)
 
-(defun ua-make-request (ua method target &key to from-tag call-id cseq headers body)
+(defun ua-make-request (ua method target &key to from from-tag call-id cseq headers body)
   (let* ((target (ensure-uri target))
          (request (make-request method target)))
     (when (ua-outbound-proxy ua)
       (add-header request "Route"
                   (make-name-addr :uri (uri-with-param (ua-outbound-proxy ua) "lr"))))
     (add-header request "Max-Forwards" "70")
-    (add-header request "From" (name-addr-with-tag (ua-aor ua) (or from-tag (make-tag))))
+    ;; FROM is for an agent that calls on someone else's behalf, as a
+    ;; back-to-back user agent does.
+    (add-header request "From" (name-addr-with-tag (if from (ensure-name-addr from) (ua-aor ua))
+                                                   (or from-tag (make-tag))))
     (add-header request "To" (if to (ensure-name-addr to) (make-name-addr :uri target)))
     (add-header request "Call-ID"
                 (or call-id

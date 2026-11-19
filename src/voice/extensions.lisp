@@ -14,6 +14,11 @@
   ring                                  ; a group: the numbers that ring together
   outbound)                             ; may dial out through the trunk
 
+(defmethod print-object ((extension extension) stream)
+  ;; Never the password: these end up in logs and backtraces.
+  (print-unreadable-object (extension stream :type t)
+    (format stream "~a~@[ ~s~]" (extension-number extension) (extension-name extension))))
+
 (defun extension-group-p (extension)
   (and (extension-ring extension) t))
 

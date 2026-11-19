@@ -30,6 +30,12 @@ the socket's public address.")
           :documentation "When true, send to wherever the peer's packets actually
 come from rather than the address it advertised (symmetric RTP), which is
 what makes media work through a NAT.")
+   (forward-source :initform nil
+                   :documentation "SSRC of the stream being forwarded out of this
+session, with the offsets that map its sequence numbers and timestamps onto
+ours (see RTP-FORWARD).")
+   (forward-sequence-offset :initform 0)
+   (forward-timestamp-offset :initform 0)
    (socket :initform nil :accessor rtp-session-socket)
    (thread :initform nil :accessor rtp-session-thread)
    (running :initform nil :accessor rtp-session-running)
@@ -139,6 +145,44 @@ timestamp advances afterwards: for G.711 that is the payload length."
             (logand (1+ (rtp-session-sequence session)) #xFFFF)
             (rtp-session-timestamp session)
             (logand (+ (rtp-session-timestamp session) samples) #xFFFFFFFF)))))
+
+(defun rtp-forward (session packet &key payload-type payload)
+  "Send PACKET, which arrived on another session, as part of SESSION's own
+stream: a relay between two calls.  The packet keeps its marker and its
+place in time (gaps, losses and reordering in the source stream are passed
+on as they are, which is what the receiver's jitter buffer needs), but takes
+this session's SSRC and continues this session's sequence numbers and
+timestamps.  PAYLOAD-TYPE and PAYLOAD replace the packet's own when the two
+calls negotiated different numbers or codecs.  Nothing is sent until the
+session knows where its peer is."
+  (when (and (rtp-session-socket session) (rtp-session-remote-host session))
+    (bt:with-lock-held ((rtp-session-lock session))
+      (with-slots (forward-source forward-sequence-offset forward-timestamp-offset) session
+        (unless (eql forward-source (rtp-packet-ssrc packet))
+          ;; A new source: its first packet continues where we left off.
+          (setf forward-source (rtp-packet-ssrc packet)
+                forward-sequence-offset (- (rtp-session-sequence session)
+                                           (rtp-packet-sequence packet))
+                forward-timestamp-offset (- (rtp-session-timestamp session)
+                                            (rtp-packet-timestamp packet))))
+        (let* ((payload (or payload (rtp-packet-payload packet)))
+               (sequence (logand (+ (rtp-packet-sequence packet) forward-sequence-offset)
+                                 #xFFFF))
+               (timestamp (logand (+ (rtp-packet-timestamp packet) forward-timestamp-offset)
+                                  #xFFFFFFFF)))
+          (prog1
+              (send-packet session
+                           (make-rtp-packet
+                            :marker (rtp-packet-marker packet)
+                            :payload-type (or payload-type (rtp-packet-payload-type packet))
+                            :sequence sequence :timestamp timestamp
+                            :ssrc (rtp-session-ssrc session)
+                            :payload payload))
+            ;; Anything sent from here afterwards (an announcement, say)
+            ;; carries on after the forwarded stream.
+            (setf (rtp-session-sequence session) (logand (1+ sequence) #xFFFF)
+                  (rtp-session-timestamp session)
+                  (logand (+ timestamp (length payload)) #xFFFFFFFF))))))))
 
 (defun rtp-send-dtmf (session digit &key (payload-type 101) (duration-ms 100)
                                       (clock-rate 8000) (volume 10))

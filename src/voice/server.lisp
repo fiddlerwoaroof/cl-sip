@@ -37,6 +37,8 @@ their calls.")
    (ring-seconds :initarg :ring-seconds :initform 30 :accessor server-ring-seconds
                  :documentation "How long an extension rings before the call counts
 as unanswered.")
+   (bridges :initform '() :accessor server-bridges
+            :documentation "Bridged calls in progress (see bridge.lisp).")
    (max-calls :initarg :max-calls :initform 2 :accessor server-max-calls
               :documentation "Agent calls allowed at once.")
    (active-calls :initform 0 :accessor server-active-calls)
@@ -84,6 +86,14 @@ as unanswered.")
 (defun dialplan-action (dialplan extension)
   (second (find-if (lambda (entry) (extension-matches-p (first entry) extension))
                    dialplan)))
+
+(defun server-route (server dialled)
+  "What to do with a call to DIALLED: an explicit dialplan entry first, then
+an extension or group of that number, then the dialplan's default."
+  (or (dialplan-action (remove :default (server-dialplan server) :key #'first) dialled)
+      (let ((extension (find-extension (server-extensions server) dialled)))
+        (and extension (list :extension extension)))
+      (dialplan-action (server-dialplan server) dialled)))
 
 ;;; Who is calling
 
@@ -275,7 +285,7 @@ NIL after rejecting the call."
     (return-from server-handle-call))
   (let* ((kind (call-kind server call))
          (extension (call-extension server call))
-         (action (dialplan-action (server-dialplan server) extension))
+         (action (server-route server extension))
          (agent (eq action :agent)))
     (server-log server "~(~a~) call from ~a to ~s -> ~s" kind
                 (let ((caller (call-caller-extension call)))
@@ -298,6 +308,8 @@ NIL after rejecting the call."
        (server-log server "  too many calls in progress")
        (sip:reject call 486))
       ((functionp action) (funcall action server call extension))
+      ((and (consp action) (eq (first action) :extension))
+       (server-call-extension server call (second action)))
       ((and (consp action) (eq (first action) :reject))
        (sip:reject call (or (second action) 486)))
       (t

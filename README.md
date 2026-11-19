@@ -191,6 +191,32 @@ From Lisp the same thing is the `:trunk` argument:
 
 Placing calls out through the trunk is not implemented yet.
 
+### Extensions
+
+Give the server a list of extensions and it becomes a small PBX: phones
+register under their numbers and call each other, with the server relaying
+the audio. Put the list in `extensions.lisp` next to the flake (it is
+git-ignored, since it holds passwords), or name another file with
+`VOICE_EXTENSIONS`:
+
+```lisp
+("100" :password "s3cret" :name "Alice")
+("101" :password "hunter2" :name "Bob" :ring-seconds 20)
+("200" :ring ("100" "101") :name "Front desk")   ; a group: both phones ring
+```
+
+Each softphone then uses its number as the user name and its password, with
+the server's address as the SIP server. With a list in place only those
+extensions can register, each only as itself, and every call a phone places
+is authenticated. Dialling an extension rings every phone registered for it
+(or for each member of a group); the first to answer gets the call. Numbers
+that are not extensions go to the dialplan as before, so the agent still
+answers anything else, and trunk callers can be routed to phones by listing
+your Flowroute number as a group, e.g. `("12065550100" :ring ("100"))`.
+
+The design and what is still to come (forwarding, transfer, dialling out)
+are in `docs/pbx-plan.md`.
+
 ### Looking things up in the wiki
 
 With a capability token for the LLM-wiki MCP server, the agent can consult

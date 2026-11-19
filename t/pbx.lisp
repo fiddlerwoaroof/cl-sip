@@ -125,3 +125,343 @@ the end together with SERVER."
                                 :sdp (sdp:sdp-string (sdp:make-audio-offer :port 40000)))))
           (is-true (wait-for-call call :terminated))
           (is (= 401 (sip:call-status call))))))))
+
+;;;; Bridged calls.  A desk is a stand-in phone that answers by itself.
+
+(defvar *sessions* '() "RTP sessions opened by the current test, to be stopped.")
+
+(defstruct desk ua session (calls '()) (received '()) (requests '()) (lock (bt:make-lock)))
+
+(defun desk-count (desk &optional payload-type)
+  (bt:with-lock-held ((desk-lock desk))
+    (count-if (lambda (p) (or (null payload-type)
+                              (= payload-type (rtp:rtp-packet-payload-type p))))
+              (desk-received desk))))
+
+(defun desk-call (desk) (first (desk-calls desk)))
+
+(defun open-desk (ua)
+  (let* ((desk (make-desk :ua ua))
+         (session (rtp:rtp-session-start
+                   (rtp:make-rtp-session
+                    :on-packet (lambda (session packet)
+                                 (declare (ignore session))
+                                 (bt:with-lock-held ((desk-lock desk))
+                                   (push packet (desk-received desk))))))))
+    (push session *sessions*)
+    (setf (desk-session desk) session)
+    desk))
+
+(defun desk-answer-sdp (desk offer-text &rest args)
+  "Answer OFFER-TEXT for DESK's session and point the session at the offerer."
+  (let* ((offer (sdp:parse-sdp offer-text))
+         (answer (apply #'sdp:make-answer offer
+                        :address "127.0.0.1"
+                        :port (rtp:rtp-session-local-port (desk-session desk))
+                        args)))
+    (multiple-value-bind (codecs direction host port) (sdp:negotiated-audio answer offer)
+      (declare (ignore codecs direction))
+      (setf (rtp:rtp-session-remote-host (desk-session desk)) host
+            (rtp:rtp-session-remote-port (desk-session desk)) port))
+    (sdp:sdp-string answer)))
+
+(defun attend (ua &key (after 0) status codecs early)
+  "Make UA behave like a phone on a desk: it rings, and after AFTER seconds
+answers (never, when AFTER is NIL).  With STATUS it refuses instead.  With
+EARLY it sends a 183 with a session description before ringing on.  Returns
+the DESK, which records the calls and the audio received."
+  (let ((desk (open-desk ua)))
+    (setf (sip:ua-on-incoming-call ua)
+          (lambda (call)
+            (push call (desk-calls desk))
+            (cond
+              (status (sip:reject call status))
+              (t
+               (flet ((answer-sdp ()
+                        (apply #'desk-answer-sdp desk (sip:call-remote-sdp call)
+                               (and codecs (list :codecs codecs)))))
+                 (if early
+                     (sip:ring call :status 183 :sdp (answer-sdp))
+                     (sip:ring call))
+                 (when after
+                   (sip:schedule (sip:ua-scheduler ua) after
+                                 (lambda ()
+                                   (when (eq (sip:call-state call) :ringing)
+                                     (sip:answer call :sdp (answer-sdp)))))))))))
+    desk))
+
+(defun dial (desk server number &key on-event (codecs sdp:*default-codecs*))
+  "Call NUMBER from DESK's phone.  Media is pointed at the server as soon
+as a session description arrives."
+  (let ((session (desk-session desk)))
+    (sip:invite (desk-ua desk) (pbx-uri server number)
+                :sdp (sdp:sdp-string
+                      (sdp:make-audio-offer :port (rtp:rtp-session-local-port session)
+                                            :codecs codecs))
+                :on-event
+                (lambda (call event &rest args &key sdp &allow-other-keys)
+                  (when (and sdp (member event '(:progress :established)))
+                    (multiple-value-bind (codecs direction host port)
+                        (sdp:negotiated-audio (sdp:parse-sdp sdp))
+                      (declare (ignore codecs direction))
+                      (setf (rtp:rtp-session-remote-host session) host
+                            (rtp:rtp-session-remote-port session) port)))
+                  (when on-event (apply on-event call event args))))))
+
+(defun say (desk packets &key (payload-type 0))
+  "Send PACKETS packets of tone from DESK."
+  (let ((payload (if (= payload-type 8)
+                     (rtp:alaw-encode (tone 160))
+                     (rtp:ulaw-encode (tone 160)))))
+    (dotimes (i packets)
+      (rtp:rtp-send (desk-session desk) payload :payload-type payload-type)
+      (sleep 1/500))))
+
+(defun hears (desk packets &optional payload-type)
+  (sip:wait-until (lambda () (>= (desk-count desk payload-type) packets)) :timeout 5))
+
+(defmacro with-pbx ((server start-form &rest phones) &body body)
+  "Run BODY with SERVER bound to the result of START-FORM and each of PHONES,
+(variable number password), a registered stand-in phone."
+  `(let ((*sessions* '())
+         (,server ,start-form))
+     (with-phones (,server ,@phones)
+       (unwind-protect
+            (progn
+              ,@(loop for (var) in phones
+                      collect `(is (eq :registered (register-phone ,var ,server))))
+              ,@body)
+         (mapc #'rtp:rtp-session-stop *sessions*)))))
+
+(test call-between-extensions
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (multiple-value-bind (on-event events) (recorder)
+      (let* ((caller (open-desk alice))
+             (callee (attend bob :after 1/4))
+             (call (dial caller server "101" :on-event on-event)))
+        (is-true (wait-for-call call :established))
+        ;; Bob's phone rang, and Alice was told so (RFC 3960: she makes her
+        ;; own ringback).
+        (is (member :ringing (event-names (funcall events))))
+        ;; Bob sees who is calling as the server vouches for it.
+        (let ((from (sip:msg-from (sip:call-invite (desk-call callee)))))
+          (is (string= "Alice" (sip:name-addr-display-name from)))
+          (is (string= "100" (sip:sip-uri-user (sip:name-addr-uri from)))))
+        (is (string= "101" (sip:sip-uri-user
+                            (sip:name-addr-uri
+                             (sip:msg-to (sip:call-invite (desk-call callee)))))))
+        (is (= 1 (length (voice::server-bridges server))))
+        ;; Audio flows both ways through the server.
+        (is-true (wait-for-call (desk-call callee) :established))
+        (say caller 10)
+        (is-true (hears callee 10 0))
+        (say callee 5)
+        (is-true (hears caller 5 0))
+        ;; Hanging up one side releases the other.
+        (sip:hangup call)
+        (is-true (wait-for-call (desk-call callee) :terminated))
+        (is (eq :remote-hangup (sip:call-cause (desk-call callee))))
+        (is-true (sip:wait-until (lambda () (null (voice::server-bridges server)))))))))
+
+(test callee-hangs-up
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let* ((caller (open-desk alice))
+           (callee (attend bob))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :established))
+      (is-true (wait-for-call (desk-call callee) :established))
+      (sip:hangup (desk-call callee))
+      (is-true (wait-for-call call :terminated))
+      (is (eq :remote-hangup (sip:call-cause call))))))
+
+(test unreachable-busy-and-declined
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let ((caller (open-desk alice)))
+      ;; Carol (102) is listed but has no phone registered.
+      (let ((call (dial caller server "102")))
+        (is-true (wait-for-call call :terminated))
+        (is (= 480 (sip:call-status call))))
+      (attend bob :status 486)
+      (let ((call (dial caller server "101")))
+        (is-true (wait-for-call call :terminated))
+        (is (= 486 (sip:call-status call))))
+      (attend bob :status 603)
+      (let ((call (dial caller server "101")))
+        (is-true (wait-for-call call :terminated))
+        (is (= 603 (sip:call-status call))))
+      (is (null (voice::server-bridges server))))))
+
+(test caller-gives-up-while-ringing
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let* ((caller (open-desk alice))
+           (callee (attend bob :after nil))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :ringing))
+      (sip:hangup call)
+      (is-true (sip:wait-until (lambda () (and (desk-call callee)
+                                               (eq :terminated
+                                                   (sip:call-state (desk-call callee)))))))
+      (is (eq :remote-cancel (sip:call-cause (desk-call callee))))
+      (is-true (wait-for-call call :terminated))
+      (is (eq :cancelled (sip:call-cause call))))))
+
+(test nobody-answers
+  (with-pbx (server (start-pbx :ring-seconds 1/2) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let* ((caller (open-desk alice))
+           (callee (attend bob :after nil))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :terminated))
+      (is (= 480 (sip:call-status call)))
+      ;; Bob's phone stops ringing.
+      (is-true (wait-for-call (desk-call callee) :terminated))
+      (is (eq :remote-cancel (sip:call-cause (desk-call callee)))))))
+
+(test every-phone-of-an-extension-rings
+  (let ((cancels '()))
+    (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+      ;; Bob has a second phone, which never answers.
+      (let ((second (start-phone "101" "bob-pw"
+                                 :trace (lambda (direction message host port)
+                                          (declare (ignore host port))
+                                          (when (and (eq direction :in)
+                                                     (sip:request-p message)
+                                                     (string= "CANCEL"
+                                                              (sip:request-method message)))
+                                            (push message cancels))))))
+        (unwind-protect
+             (progn
+               (is (eq :registered (register-phone second server)))
+               (let* ((caller (open-desk alice))
+                      (first-desk (attend bob :after 1/4))
+                      (second-desk (attend second :after nil))
+                      (call (dial caller server "101")))
+                 (is-true (wait-for-call call :established))
+                 (is-true (wait-for-call (desk-call first-desk) :established))
+                 ;; The phone that lost is told why (RFC 3326).
+                 (is-true (wait-for-call (desk-call second-desk) :terminated))
+                 (is (= 1 (length cancels)))
+                 (is (search "cause=200" (sip:header (first cancels) "Reason")))
+                 (say caller 5)
+                 (is-true (hears first-desk 5))
+                 (is (zerop (desk-count second-desk)))
+                 (sip:hangup call)
+                 (is-true (wait-for-call call :terminated))))
+          (sip:stop second))))))
+
+(test ring-group
+  (with-pbx (server (start-pbx :extensions (append *extensions*
+                                                   '(("200" :ring ("101" "102") :name "Desk"))))
+                    (alice "100" "alice-pw") (bob "101" "bob-pw") (carol "102" "carol-pw"))
+    (let* ((caller (open-desk alice))
+           (bob-desk (attend bob :after nil))
+           (carol-desk (attend carol :after 1/4))
+           (call (dial caller server "200")))
+      (is-true (wait-for-call call :established))
+      (is-true (wait-for-call (desk-call carol-desk) :established))
+      (is-true (wait-for-call (desk-call bob-desk) :terminated))
+      (say caller 5)
+      (is-true (hears carol-desk 5))
+      (sip:hangup call)
+      (is-true (wait-for-call (desk-call carol-desk) :terminated)))))
+
+(test bridge-transcodes-and-relays-telephone-events
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let* ((caller (open-desk alice))
+           ;; Bob's phone only speaks A-law; Alice's numbers telephone events
+           ;; 96 where the server's own offer to Bob says 101.
+           (callee (attend bob :codecs (list (sdp:make-codec :payload-type 8 :name "PCMA")
+                                             (sdp:make-codec :payload-type 101
+                                                             :name "telephone-event"
+                                                             :fmtp "0-15"))))
+           (call (dial caller server "101"
+                       :codecs (list (sdp:make-codec :payload-type 0 :name "PCMU")
+                                     (sdp:make-codec :payload-type 96
+                                                     :name "telephone-event"
+                                                     :fmtp "0-15")))))
+      (is-true (wait-for-call call :established))
+      (is-true (wait-for-call (desk-call callee) :established))
+      (say caller 5 :payload-type 0)
+      (is-true (hears callee 5 8))
+      (is (zerop (desk-count callee 0)))
+      ;; The tone survives the change of law.
+      (let ((payload (rtp:rtp-packet-payload (first (desk-received callee)))))
+        (is (< 4000 (voice:rms (rtp:alaw-decode payload)) 7000)))
+      (say callee 5 :payload-type 8)
+      (is-true (hears caller 5 0))
+      ;; A digit pressed by Alice (payload type 96) reaches Bob as 101.
+      (let ((sent (rtp:rtp-send-dtmf (desk-session caller) #\5 :payload-type 96)))
+        (is-true (hears callee (length sent) 101))
+        (let ((event (rtp:decode-telephone-event
+                      (rtp:rtp-packet-payload
+                       (find 101 (desk-received callee) :key #'rtp:rtp-packet-payload-type)))))
+          (is (= 5 (rtp:telephone-event-event event)))))
+      (sip:hangup call)
+      (is-true (wait-for-call call :terminated)))))
+
+(test early-media-is-relayed
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (multiple-value-bind (on-event events) (recorder)
+      (let* ((caller (open-desk alice))
+             (callee (attend bob :after 1 :early t))
+             (call (dial caller server "101" :on-event on-event)))
+        ;; A 183 with a session description reaches Alice before any answer,
+        (is-true (sip:wait-until
+                  (lambda () (find :progress (funcall events) :key #'car))))
+        (let ((progress (find :progress (funcall events) :key #'car)))
+          (is (= 183 (getf (cdr progress) :status)))
+          (is-true (getf (cdr progress) :sdp)))
+        (is (not (eq :established (sip:call-state call))))
+        ;; and what Bob's side plays is heard meanwhile.
+        (say callee 5)
+        (is-true (hears caller 5))
+        (is-true (wait-for-call call :established))
+        (say callee 5)
+        (is-true (hears caller 10))
+        (sip:hangup call)
+        (is-true (wait-for-call call :terminated))))))
+
+(test rtp-forwarding
+  ;; The relay keeps a stream's shape: gaps and markers pass through, on the
+  ;; forwarding session's own numbering.
+  (let* ((received '())
+         (lock (bt:make-lock))
+         (sink (rtp:rtp-session-start
+                (rtp:make-rtp-session
+                 :on-packet (lambda (s p) (declare (ignore s))
+                              (bt:with-lock-held (lock) (push p received))))))
+         (out (rtp:rtp-session-start
+               (rtp:make-rtp-session :remote-host "127.0.0.1"
+                                     :remote-port (rtp:rtp-session-local-port sink)))))
+    (unwind-protect
+         (flet ((packet (sequence timestamp &key marker (ssrc 7))
+                  (rtp:make-rtp-packet :sequence sequence :timestamp timestamp :ssrc ssrc
+                                       :marker marker :payload-type 0
+                                       :payload (rtp:ulaw-encode (tone 160)))))
+           (rtp:rtp-forward out (packet 65535 1000 :marker t))
+           (rtp:rtp-forward out (packet 0 1160))
+           ;; One packet lost, and a pause in the talking.
+           (rtp:rtp-forward out (packet 2 5000) :payload-type 8)
+           ;; Another source takes over; the stream continues unbroken.
+           (rtp:rtp-forward out (packet 400 90000 :ssrc 9))
+           (is-true (sip:wait-until (lambda () (= 4 (length received)))))
+           (let* ((packets (sort (copy-list received) #'<
+                                 :key (lambda (p)
+                                        (mod (- (rtp:rtp-packet-sequence p)
+                                                (rtp:rtp-packet-sequence
+                                                 (car (last received))))
+                                             65536))))
+                  (base (first packets)))
+             (flet ((sequence-of (p) (mod (- (rtp:rtp-packet-sequence p)
+                                             (rtp:rtp-packet-sequence base))
+                                          65536))
+                    (time-of (p) (mod (- (rtp:rtp-packet-timestamp p)
+                                         (rtp:rtp-packet-timestamp base))
+                                      (expt 2 32))))
+               (is (equal '(0 1 3 4) (mapcar #'sequence-of packets)))
+               (is (equal '(0 160 4000 4160) (mapcar #'time-of packets)))
+               (is (equal '(t nil nil nil) (mapcar #'rtp:rtp-packet-marker packets)))
+               (is (equal '(0 0 8 0) (mapcar #'rtp:rtp-packet-payload-type packets)))
+               (is (every (lambda (p) (= (rtp:rtp-session-ssrc out) (rtp:rtp-packet-ssrc p)))
+                          packets)))))
+      (rtp:rtp-session-stop out)
+      (rtp:rtp-session-stop sink))))

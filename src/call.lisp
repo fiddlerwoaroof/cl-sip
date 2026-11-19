@@ -30,6 +30,9 @@
    (got-provisional :initform nil :accessor call-got-provisional)
    (cancel-requested :initform nil :accessor call-cancel-requested)
    (cancel-sent :initform nil :accessor call-cancel-sent)
+   (hangup-headers :initform '() :accessor call-hangup-headers
+                   :documentation "Extra headers for the CANCEL or BYE that ends the
+call, a Reason for instance (RFC 3326).")
    (ack :initform nil :accessor call-ack
         :documentation "(request transport host port) of the last ACK sent for a 2xx.")
    (answer-function :initarg :answer-function :initform nil
@@ -90,13 +93,15 @@ the offer from the 2xx, returns the answer to put in the ACK.")
 
 ;;;; UAC side (section 13.2)
 
-(defun invite (ua target &key to sdp headers on-event answer-function user-data)
+(defun invite (ua target &key to from sdp headers on-event answer-function user-data)
   "Call TARGET (a SIP URI or string), offering the session description SDP
 (a string).  TO is the logical recipient when it differs from TARGET, as it
-does when calling a registered contact directly.  Returns a CALL immediately;
-progress arrives through ON-EVENT."
+does when calling a registered contact directly; FROM is the caller when
+that is not this agent itself.  Returns a CALL immediately; progress arrives
+through ON-EVENT."
   (on-loop ((ua-scheduler ua))
-    (let* ((request (ua-make-request ua "INVITE" target :to to :headers headers :body sdp))
+    (let* ((request (ua-make-request ua "INVITE" target :to to :from from
+                                                        :headers headers :body sdp))
            (call (make-instance 'call :ua ua :direction :outgoing :state :calling
                                       :on-event on-event :local-sdp sdp
                                       :answer-function answer-function
@@ -252,6 +257,8 @@ Returns (request transport host port) for retransmission."
       (dolist (name '("Authorization" "Proxy-Authorization"))
         (dolist (value (header-values invite name))
           (add-header cancel name value)))
+      (loop for (name value) in (call-hangup-headers call)
+            do (add-header cancel name value))
       (ignore-errors
        (send-request (call-stack call) cancel nil
                      :branch (via-branch (msg-top-via invite))))
@@ -446,7 +453,7 @@ into the response: a challenge with 401, a Reason, a Retry-After."
   (setf (call-state call) :terminating
         (call-pending-2xx call) nil)
   (cancel-timer (call-pending-2xx-timer call))
-  (ua-send (call-ua call) (call-make-request call "BYE")
+  (ua-send (call-ua call) (call-make-request call "BYE" :headers (call-hangup-headers call))
            (lambda (creq event argument)
              (declare (ignore creq))
              (when (or (not (eq event :response))
@@ -454,11 +461,13 @@ into the response: a challenge with 401, a Reason, a Retry-After."
                (call-terminate call cause)))
            :dialog (call-dialog call)))
 
-(defun hangup (call)
+(defun hangup (call &key headers)
   "End CALL by whatever the protocol requires in its current state: CANCEL
 for an outgoing call not yet answered, a rejection for an incoming one, BYE
-for an established session."
+for an established session.  HEADERS, a list of (name value), go into the
+CANCEL or BYE: a Reason saying why, for instance (RFC 3326)."
   (on-loop ((call-scheduler call))
+    (when headers (setf (call-hangup-headers call) headers))
     (case (call-state call)
       ((:calling :proceeding)
        (setf (call-cancel-requested call) t

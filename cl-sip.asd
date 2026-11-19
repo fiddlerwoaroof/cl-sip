@@ -49,7 +49,8 @@
      (:file "backends")
      (:file "agent")
      (:file "extensions")
-     (:file "server")))))
+     (:file "server")
+     (:file "bridge")))))
 
 (defsystem "cl-sip/examples"
   :depends-on ("cl-sip")
