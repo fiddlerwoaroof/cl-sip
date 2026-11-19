@@ -309,3 +309,111 @@ session and a function returning the packets received so far."
               (is (eq :remote-hangup (sip:call-cause call)))
               (is (= 1 (length spoken))))))
       (voice:stop-server server))))
+
+;;; Trunk: a stand-in provider on loopback that the server registers with.
+
+(test source-screening
+  (let ((server (voice:start-server :port 0 :tcp nil :log-stream nil
+                                    :allow '("192.168.7.0/24")
+                                    :trunk '(:registrar "sip:127.0.0.1:9" :username "u"
+                                             :password "p" :ranges ("198.51.100.0/28")))))
+    (unwind-protect
+         (progn
+           (is (eq :trunk (voice::server-source-kind server "198.51.100.3")))
+           (is (eq :local (voice::server-source-kind server "127.0.0.1")))
+           (is (eq :local (voice::server-source-kind server "192.168.7.20")))
+           (is (null (voice::server-source-kind server "192.168.8.20")))
+           (is (null (voice::server-source-kind server "198.51.100.16")))
+           (is (null (voice::server-source-kind server "203.0.113.50"))))
+      (voice:stop-server server)))
+  (is (equal voice:*flowroute-signalling-ranges* '("34.210.91.112/28" "34.226.36.32/28")))
+  (is (voice::same-number-p "+1 (206) 555-0199" "2065550199"))
+  (is (voice::same-number-p "12065550199" "+12065550199"))
+  (is (not (voice::same-number-p "12065550198" "2065550199")))
+  (is (not (voice::same-number-p "" "2065550199"))))
+
+(test trunk-registration-and-inbound-call
+  (let* ((registrar (sip:make-registrar :realm "provider" :users '(("12345678" . "secret"))))
+         (provider (sip:make-user-agent :aor "sip:12065550199@127.0.0.1"
+                                        :transports '((:udp :host "127.0.0.1" :port 0))
+                                        :registrar registrar))
+         (server nil)
+         (spoken '()))
+    (sip:start provider)
+    (unwind-protect
+         (let ((provider-port (sip:transport-port
+                               (first (sip:stack-transports (sip:ua-stack provider))))))
+           (setf server
+                 (voice:start-server
+                  :port 0 :tcp nil :log-stream nil :greeting "Hello."
+                  :dialplan '(("12065550100" :agent) (:default (:reject 404)))
+                  :allowed-callers '("206-555-0199")
+                  :trunk (list :registrar (format nil "sip:127.0.0.1:~d" provider-port)
+                               :username "12345678" :password "secret"
+                               :ranges '("127.0.0.0/8"))
+                  :stt (voice:make-function-stt (lambda (samples rate)
+                                                  (declare (ignore samples rate)) nil))
+                  :llm (voice:make-function-llm (lambda (messages)
+                                                  (declare (ignore messages)) "Fine."))
+                  :tts (voice:make-function-tts (lambda (text)
+                                                  (push text spoken) (tone 1600)))))
+           ;; The server registers with digest credentials, as the tech prefix.
+           (is-true (sip:wait-until
+                     (lambda () (eq :registered (sip:registration-state
+                                                 (voice:server-registration server))))))
+           (let ((contacts (sip:registrar-lookup registrar provider "sip:12345678@127.0.0.1")))
+             (is (= 1 (length contacts)))
+             (is (= (voice:server-port server) (sip:sip-uri-port (first contacts))))
+             (flet ((call-number (ua number function)
+                      ;; As a provider does: the INVITE goes to the registered
+                      ;; contact, and the number called is in the To header.
+                      (let* ((packets 0)
+                             (session (rtp:rtp-session-start
+                                       (rtp:make-rtp-session
+                                        :on-packet (lambda (s p)
+                                                     (declare (ignore s p))
+                                                     (incf packets)))))
+                             (call (sip:invite
+                                    ua (first contacts)
+                                    :to (format nil "<sip:+~a@127.0.0.1>" number)
+                                    :sdp (sdp:sdp-string
+                                          (sdp:make-audio-offer
+                                           :port (rtp:rtp-session-local-port session))))))
+                        (unwind-protect
+                             (progn
+                               (sip:wait-until (lambda () (member (sip:call-state call)
+                                                                  '(:established :terminated))))
+                               (funcall function call (lambda () packets))
+                               (sip:hangup call)
+                               (sip:wait-until (lambda () (eq :terminated (sip:call-state call)))))
+                          (rtp:rtp-session-stop session)))))
+               ;; A call to our number from an allowed caller reaches the agent.
+               (call-number provider "12065550100"
+                            (lambda (call packets)
+                              (is (eq :established (sip:call-state call)))
+                              (is-true (sip:wait-until (lambda () (>= (funcall packets) 10))))
+                              (is (equal '("Hello.") spoken))))
+               ;; Another number is not in the dialplan.
+               (call-number provider "12065550111"
+                            (lambda (call packets)
+                              (declare (ignore packets))
+                              (is (eq :terminated (sip:call-state call)))
+                              (is (= 404 (sip:call-status call)))))
+               ;; A caller who is not on the list is declined.
+               (let ((stranger (sip:make-user-agent
+                                :aor "sip:13125550123@127.0.0.1"
+                                :transports '((:udp :host "127.0.0.1" :port 0)))))
+                 (sip:start stranger)
+                 (unwind-protect
+                      (call-number stranger "12065550100"
+                                   (lambda (call packets)
+                                     (declare (ignore packets))
+                                     (is (eq :terminated (sip:call-state call)))
+                                     (is (= 603 (sip:call-status call)))))
+                   (sip:stop stranger)))))
+           ;; Stopping the server removes its registration.
+           (voice:stop-server server)
+           (setf server nil)
+           (is (null (sip:registrar-lookup registrar provider "sip:12345678@127.0.0.1"))))
+      (when server (voice:stop-server server))
+      (sip:stop provider))))

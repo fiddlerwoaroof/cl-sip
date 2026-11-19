@@ -81,7 +81,8 @@
    #:client-request #:creq-request #:creq-transaction
 
    ;; registration
-   #:registration #:register #:unregister #:fetch-bindings
+   #:registration #:register #:unregister #:fetch-bindings #:refresh-registration
+   #:registration-contact
    #:registration-state #:registration-expires #:registration-bindings
    #:registration-last-response #:registration-on-event
    #:registrar #:make-registrar #:registrar-lookup #:registrar-users

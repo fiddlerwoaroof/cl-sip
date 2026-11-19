@@ -212,6 +212,11 @@ between keep-alive packets to the registrar."
                             :call-id (make-call-id) :on-event on-event :refresh refresh)))
       (registration-send registration :register))))
 
+(defun refresh-registration (registration)
+  "Send REGISTER again now, for instance to retry after a failure."
+  (on-loop ((ua-scheduler (registration-ua registration)))
+    (registration-send registration :register)))
+
 (defun unregister (registration &key all)
   "Remove this agent's binding, or with ALL every binding of the
 address-of-record (Contact: *)."

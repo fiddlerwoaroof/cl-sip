@@ -123,13 +123,67 @@ and dial:
 
 The routing is the `:dialplan` argument (see `*default-dialplan*`): patterns
 map to `:agent`, `:echo`, `(:say "text")`, `(:play "file.wav")`,
-`(:reject status)` or a function of your own. To reach it from another
-device on your network, start it with `VOICE_HOST=0.0.0.0`; there is no
-authentication on calls, so keep it off untrusted networks.
+`(:reject status)` or a function of your own.
+
+Only this machine may register and call by default; requests from anywhere
+else are dropped without an answer. To let other devices on your network
+in, listen on all interfaces and name the network:
+
+```sh
+VOICE_HOST=0.0.0.0 VOICE_ALLOW=192.168.1.0/24 direnv exec . bin/voice-server
+```
 
 Each stage is replaceable: `start-server` takes `:stt`, `:llm` and `:tts`
 objects. `make-claude-llm` accepts `:model`, `:system` and `:effort`, and
 `make-say-tts` accepts `:voice`.
+
+### Connecting a phone number (Flowroute)
+
+With SIP credentials in the environment the server registers with Flowroute,
+and calls to your number are answered by the agent:
+
+```sh
+export FLOWROUTE_USERNAME=...     # the tech prefix (Interconnections > Registration)
+export FLOWROUTE_PASSWORD=...     # the SIP password shown there
+export FLOWROUTE_POP=us-west-or   # or us-east-va
+direnv exec . bin/voice-server
+```
+
+In the Flowroute portal, route the number to "SIP registration" on the same
+point of presence. The server then listens on all interfaces, registers,
+learns its public address from Flowroute's replies, re-registers with it,
+and sends a keep-alive every 25 seconds so the router keeps the path open.
+Requests are accepted only from this machine, `VOICE_ALLOW` networks, and
+Flowroute's signalling addresses.
+
+Flowroute does not relay audio: it flows directly between the carrier's
+gateway and this machine, so the audio port has to be reachable through your
+router. Pick one:
+
+| Option | Setting | Notes |
+|---|---|---|
+| Port forwarding | `VOICE_RTP_PORTS=40000-40019`, and forward that UDP range to this machine | Dependable. Two ports are not needed per call; one is. |
+| STUN | `VOICE_STUN=host:port` | No router changes; does not work behind routers that give each destination a different port. |
+| Neither | | Works only if the router keeps port numbers unchanged. |
+
+Other settings: `VOICE_ALLOWED_CALLERS=2065550199,...` answers only those
+callers (each call spends API tokens), and `VOICE_MAX_CALLS` (default 2)
+caps simultaneous agent calls. A trunk call is routed by the number that was
+called, so a dialplan entry such as `("12065550100" :agent)` applies to it;
+the default dialplan sends everything to the agent.
+
+From Lisp the same thing is the `:trunk` argument:
+
+```lisp
+(cl-sip.voice:start-server
+ :host "0.0.0.0"
+ :trunk '(:registrar "sip:us-west-or.sip.flowroute.com"
+          :username "12345678" :password "...")
+ :rtp-port-range '(40000 . 40019)
+ :allowed-callers '("2065550199"))
+```
+
+Placing calls out through the trunk is not implemented yet.
 
 ### A cloned voice
 

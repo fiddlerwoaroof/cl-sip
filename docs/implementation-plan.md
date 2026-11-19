@@ -575,3 +575,37 @@ softphone ──SIP──▶ phone server (registrar + dialplan) ──▶ voice
 - **Not done yet:** calls between two registered phones (needs a
   back-to-back UA with an RTP relay), DTMF input, and conversation length
   limits.
+
+## 11. Trunking (Flowroute)
+
+Inbound calls from a SIP provider reach the voice agent. What Flowroute
+requires, from its documentation (November 2026): digest registration with
+the tech prefix as user name against `us-west-or.sip.flowroute.com` or
+`us-east-va.sip.flowroute.com` on port 5060 (UDP or TCP); G.711 and RFC 4733
+DTMF; no PRACK or UPDATE; signalling from `34.210.91.112/28` and
+`34.226.36.32/28`; and media sent directly by the upstream carrier from any
+address.
+
+- **Signalling through NAT** (`registration.lisp`): the first REGISTER
+  carries the local contact. The reply's `received`/`rport` (RFC 3581) give
+  the public address, which is stored on the transport; a second REGISTER
+  removes the local contact and adds the public one. Contacts given to peers
+  with public addresses use it from then on. A double CRLF is sent to the
+  registrar every 25 s (RFC 5626 section 3.5.1 defines this for stream
+  transports; over UDP it is common practice rather than standard).
+- **Media through NAT** (`rtp/stun.lisp`, `rtp/session.lisp`): RTP sockets
+  can bind in a fixed range that the router forwards, or ask a STUN server
+  (RFC 8489 Binding request) for their public address. The SDP answer to a
+  trunk call advertises the public address; local phones still get the
+  local one. Sending is symmetric (RFC 4961).
+- **Screening** (`ua.lisp`, `voice/server.lisp`): a request filter drops,
+  unanswered, anything not from this machine, an allowed network or the
+  trunk's ranges. Trunk calls can be limited to listed caller numbers and to
+  a number of simultaneous agent calls.
+- **Routing**: a trunk delivers the INVITE to the registered contact, so
+  the number called is taken from the To header. Flowroute's documentation
+  does not show the inbound Request-URI; the server logs both for each trunk
+  call so this can be confirmed on the first one.
+- **Not done:** DNS SRV/NAPTR (RFC 3263; the A records suffice), outbound
+  calls through the trunk, TLS, session timers (RFC 4028, optional for
+  Flowroute), and P-Asserted-Identity handling (RFC 3325).

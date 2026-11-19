@@ -21,5 +21,6 @@
    ;; agent
    #:voice-agent #:start-agent #:stop-agent #:agent-messages
    ;; server
-   #:phone-server #:start-server #:stop-server #:server-ua #:server-port
+   #:phone-server #:start-server #:start-server-from-environment #:stop-server
+   #:server-ua #:server-port #:server-registration #:*flowroute-signalling-ranges*
    #:*default-dialplan*))

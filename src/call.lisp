@@ -90,11 +90,13 @@ the offer from the 2xx, returns the answer to put in the ACK.")
 
 ;;;; UAC side (section 13.2)
 
-(defun invite (ua target &key sdp headers on-event answer-function user-data)
+(defun invite (ua target &key to sdp headers on-event answer-function user-data)
   "Call TARGET (a SIP URI or string), offering the session description SDP
-(a string).  Returns a CALL immediately; progress arrives through ON-EVENT."
+(a string).  TO is the logical recipient when it differs from TARGET, as it
+does when calling a registered contact directly.  Returns a CALL immediately;
+progress arrives through ON-EVENT."
   (on-loop ((ua-scheduler ua))
-    (let* ((request (ua-make-request ua "INVITE" target :headers headers :body sdp))
+    (let* ((request (ua-make-request ua "INVITE" target :to to :headers headers :body sdp))
            (call (make-instance 'call :ua ua :direction :outgoing :state :calling
                                       :on-event on-event :local-sdp sdp
                                       :answer-function answer-function
