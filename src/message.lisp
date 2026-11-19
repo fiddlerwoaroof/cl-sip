@@ -38,7 +38,8 @@ though a loose Route follows (section 8.1.2).")))
 
 (defparameter *reason-phrases*
   '((100 . "Trying") (180 . "Ringing") (181 . "Call Is Being Forwarded")
-    (182 . "Queued") (183 . "Session Progress") (200 . "OK")
+    (182 . "Queued") (183 . "Session Progress") (200 . "OK") (202 . "Accepted")
+    (489 . "Bad Event")
     (300 . "Multiple Choices") (301 . "Moved Permanently")
     (302 . "Moved Temporarily") (305 . "Use Proxy") (380 . "Alternative Service")
     (400 . "Bad Request") (401 . "Unauthorized") (402 . "Payment Required")

@@ -127,8 +127,12 @@ as the voice tests do. No phase needs a real softphone or the real trunk.
 - Attended: Refer-To carries `Replaces` naming the transferor's other call
   on this server; the server joins the two far parties and releases both of
   the transferor's legs.
-- INVITE with a `Replaces` header naming a server-side leg takes that leg's
-  place (pickup and attended transfer done by the endpoint).
+- A transfer target that is not an extension (the agent, an announcement)
+  is handled by the server taking the remaining party's call itself.
+- Deferred: INVITE with a `Replaces` header (RFC 3891 as a UAS), which call
+  pickup needs. Phones transferring through this server use REFER, which the
+  server acts on itself, so nothing here depends on it; a `Require:
+  replaces` is refused with 420 like any other extension.
 
 ### Phase 6 — Dialling out through the trunk
 
@@ -163,6 +167,6 @@ Updated as phases land.
 | 2 Bridged calls | done |
 | 3 Changes during a call | done |
 | 4 Forwarding | done |
-| 5 Transfer | planned |
+| 5 Transfer | done, except INVITE with Replaces |
 | 6 Dialling out | planned |
 | 7 Events | planned |

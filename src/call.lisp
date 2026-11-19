@@ -20,6 +20,8 @@
 :established (:sdp), :reinvite (:sdp :request; also for an UPDATE carrying an
 offer), :reinvite-accepted (:sdp), :reinvite-rejected (:status),
 :update-accepted (:sdp), :update-rejected (:status),
+:refer (:refer-to :replaces :notify :request; only with ACCEPT-REFER),
+:refer-accepted, :refer-rejected (:status), :refer-progress (:status :final),
 :terminated (:cause :status :response).")
    (local-sdp :initarg :local-sdp :initform nil :accessor call-local-sdp)
    (remote-sdp :initarg :remote-sdp :initform nil :accessor call-remote-sdp)
@@ -52,7 +54,11 @@ the offer from the 2xx, returns the answer to put in the ACK.")
                          :accessor call-auto-answer-reinvite)
    (reinvite-tx :initform nil :accessor call-reinvite-tx)
    (reinvite-request :initform nil :accessor call-reinvite-request)
-   (reinvite-creq :initform nil :accessor call-reinvite-creq)))
+   (reinvite-creq :initform nil :accessor call-reinvite-creq)
+   ;; REFER
+   (accept-refer :initarg :accept-refer :initform nil :accessor call-accept-refer
+                 :documentation "When true, a REFER from the other party is accepted
+and reported as a :refer event; otherwise it is declined.")))
 
 (defmethod print-object ((call call) stream)
   (print-unreadable-object (call stream :type t :identity t)
@@ -454,6 +460,10 @@ into the response: a challenge with 401, a Reason, a Retry-After."
        (call-handle-reinvite call request tx))
       ((string= method "UPDATE")
        (call-handle-update call request tx))
+      ((string= method "REFER")
+       (call-handle-refer call request tx))
+      ((string= method "NOTIFY")
+       (call-handle-notify call request tx))
       ((string= method "OPTIONS")
        (ua-handle-options ua request tx))
       (t
@@ -559,6 +569,139 @@ arrives as an :update-accepted or :update-rejected event."
                                                              :response argument)))))
                  :dialog (call-dialog call))))
     call))
+
+;;; REFER (RFC 3515) and its use for transfer (RFC 5589, RFC 3891)
+
+(defun call-replaces (call)
+  "The value that names CALL's dialog to the party at its other end, for a
+Replaces header or the Replaces of a Refer-To URI (RFC 3891 section 6.1):
+the to-tag is that party's tag, the from-tag ours."
+  (let ((dialog (call-dialog call)))
+    (format nil "~a;to-tag=~a;from-tag=~a" (dialog-call-id dialog)
+            (dialog-remote-tag dialog) (dialog-local-tag dialog))))
+
+(defun parse-replaces (value)
+  "A Replaces value as a plist of :CALL-ID, :TO-TAG, :FROM-TAG and
+:EARLY-ONLY, or NIL when it is malformed."
+  (let* ((pieces (mapcar #'trim-ws (split-top-level value #\;)))
+         (params (loop for piece in (rest pieces)
+                       for eq = (position #\= piece)
+                       collect (cons (string-downcase (subseq piece 0 eq))
+                                     (and eq (subseq piece (1+ eq))))))
+         (to-tag (cdr (assoc "to-tag" params :test #'string=)))
+         (from-tag (cdr (assoc "from-tag" params :test #'string=))))
+    (when (and pieces (plusp (length (first pieces))) to-tag from-tag)
+      (list :call-id (first pieces) :to-tag to-tag :from-tag from-tag
+            :early-only (and (assoc "early-only" params :test #'string=) t)))))
+
+(defun find-replaced-call (ua replaces)
+  "The call of UA whose dialog REPLACES, a plist from PARSE-REPLACES,
+names (RFC 3891 section 3): the to-tag is our tag in that dialog."
+  (destructuring-bind (&key call-id to-tag from-tag &allow-other-keys) replaces
+    (values (gethash (list call-id to-tag from-tag) (ua-dialog-owners ua)))))
+
+(defun refer (call target &key replaces)
+  "Ask the other party of CALL to call TARGET (a URI or string) instead: a
+transfer.  With REPLACES, another call of ours, the new call is to take that
+call's place at TARGET, which joins the two far parties (attended transfer,
+RFC 5589 section 7).  The request's fate arrives as :refer-accepted or
+:refer-rejected, and the other party's progress with the new call as
+:refer-progress events carrying the SIP status it reports."
+  (on-loop ((call-scheduler call))
+    (when (eq (call-state call) :established)
+      (let* ((uri (copy-sip-uri (ensure-uri target)))
+             (ua (call-ua call)))
+        (when replaces
+          (setf (sip-uri-headers uri)
+                (append (sip-uri-headers uri)
+                        (list (cons "Replaces" (call-replaces replaces))))))
+        (ua-send ua
+                 (call-make-request
+                  call "REFER"
+                  :headers `(("Refer-To" ,(make-name-addr :uri uri))
+                             ("Referred-By" ,(make-name-addr
+                                              :uri (name-addr-uri (ua-aor ua))))
+                             ("Contact" ,(ua-contact ua))))
+                 (lambda (creq event argument)
+                   (declare (ignore creq))
+                   (let ((status (and (eq event :response) (response-status argument))))
+                     (cond ((call-terminated-p call))
+                           ((and status (< status 200)))
+                           ((and status (< status 300))
+                            (call-fire call :refer-accepted :response argument))
+                           (t (call-fire call :refer-rejected :status status
+                                                              :response argument)))))
+                 :dialog (call-dialog call))))
+    call))
+
+(defun call-notify-refer (call refer status final)
+  "Tell the party that sent the REFER request how the call it asked for is
+going: a NOTIFY whose body is the status line of the latest response
+(RFC 3515 section 2.4.5).  FINAL ends the implicit subscription."
+  (when (and (call-dialog call) (eq (call-state call) :established))
+    (ua-send (call-ua call)
+             (call-make-request
+              call "NOTIFY"
+              :headers `(("Event" ,(format nil "refer;id=~d" (cseq-number (msg-cseq refer))))
+                         ("Subscription-State" ,(if final
+                                                    "terminated;reason=noresource"
+                                                    "active;expires=60"))
+                         ("Contact" ,(ua-contact (call-ua call)))
+                         ("Content-Type" "message/sipfrag;version=2.0"))
+              :body (format nil "SIP/2.0 ~d ~a~c~c" status (reason-phrase status)
+                            #\Return #\Newline))
+             (lambda (creq event argument)
+               (declare (ignore creq event argument)))
+             :dialog (call-dialog call))))
+
+(defun call-handle-refer (call request tx)
+  "RFC 3515 section 2.4.2."
+  (let* ((ua (call-ua call))
+         (values (header-values request "Refer-To"))
+         (refer-to (and (null (rest values))
+                        (first values)
+                        (ignore-errors (parse-name-addr (first values)))))
+         (uri (and refer-to (name-addr-uri refer-to))))
+    (cond
+      ((null refer-to)
+       ;; None, several, or nonsense.
+       (ua-respond ua tx request 400))
+      ((not (and (call-accept-refer call) (eq (call-state call) :established)))
+       (ua-respond ua tx request 603))
+      (t
+       (ua-respond ua tx request 202
+                   :headers `(("Contact" ,(ua-contact-for ua request))))
+       ;; The subscription the REFER creates starts with a NOTIFY at once.
+       (call-notify-refer call request 100 nil)
+       (call-fire call :refer
+                  :refer-to refer-to
+                  :replaces (and (sip-uri-p uri)
+                                 (let ((value (cdr (assoc "Replaces" (sip-uri-headers uri)
+                                                          :test #'string-equal))))
+                                   (and value (parse-replaces value))))
+                  :notify (lambda (status &optional final)
+                            (call-notify-refer call request status final))
+                  :request request)))))
+
+(defun call-handle-notify (call request tx)
+  "A NOTIFY about a REFER we sent (RFC 3515 section 2.4.4)."
+  (let ((ua (call-ua call))
+        (event (header request "Event")))
+    (cond
+      ((not (and event (alexandria:starts-with-subseq "refer" (string-downcase
+                                                              (trim-ws event)))))
+       (ua-respond ua tx request 489))
+      (t
+       (ua-respond ua tx request 200)
+       (let* ((body (or (message-body-string request) ""))
+              (status (and (alexandria:starts-with-subseq "SIP/2.0 " body)
+                           (parse-integer body :start 8 :junk-allowed t)))
+              (state (string-downcase (or (header request "Subscription-State") ""))))
+         (when status
+           (call-fire call :refer-progress
+                      :status status
+                      :final (and (search "terminated" state) t)
+                      :request request)))))))
 
 ;;; re-INVITE (section 14)
 

@@ -24,7 +24,12 @@
               :documentation "The session description last sent on this leg.")
    (sdp-text :initform nil :accessor leg-sdp-text)
    (held :initform nil :accessor leg-held
-         :documentation "True while this leg's phone has the call on hold.")))
+         :documentation "True while this leg's phone has the call on hold.")
+   (told-held :initform nil :accessor leg-told-held
+              :documentation "True while this leg has been offered sendonly because
+the other party is holding.")
+   (party :initarg :party :initform nil :accessor leg-party
+          :documentation "Who is at the far end, as a name-addr the server vouches for.")))
 
 (defun server-open-leg (server &key call trunk target)
   "A leg with its RTP session bound and receiving."
@@ -47,6 +52,13 @@ for the trunk, local for a phone."
                 (sip:transport-advertised-host transport))
             (or (and (leg-trunk-p leg) (rtp:rtp-session-public-port session))
                 (rtp:rtp-session-local-port session)))))
+
+(defun leg-label (leg)
+  "Who is on LEG, for the log."
+  (let ((party (leg-party leg)))
+    (cond ((null party) "someone")
+          ((stringp party) party)
+          (t (sip:uri-string (sip:name-addr-uri party))))))
 
 (defun leg-disconnect (leg)
   (setf (rtp:rtp-session-on-packet (leg-session leg)) nil))
@@ -173,7 +185,7 @@ other leg negotiated."
 
 (defclass bridge ()
   ((server :initarg :server :reader bridge-server)
-   (a :initarg :a :reader bridge-a :documentation "The leg of the call that came in.")
+   (a :initarg :a :accessor bridge-a :documentation "The leg of the call that came in.")
    (b :initform nil :accessor bridge-b :documentation "The leg that answered.")
    (forks :initform '() :accessor bridge-forks
           :documentation "Outgoing legs still ringing.")
@@ -188,7 +200,15 @@ other leg negotiated."
    (label :initarg :label :initform "call" :reader bridge-label)
    (on-failed :initarg :on-failed :initform nil :reader bridge-on-failed
               :documentation "(lambda (status reason)) called instead of refusing
-A when nobody answers; REASON is :busy, :declined, :no-answer or :unavailable.")))
+A when nobody answers; REASON is :busy, :declined, :no-answer or :unavailable.")
+   (established :initarg :established :initform nil :reader bridge-established-p
+                :documentation "True when A is a call already in progress, for whom a
+new party is being rung (a transfer).  A is then left alone until someone
+answers, and ON-ANSWERED decides what happens.")
+   (on-answered :initarg :on-answered :initform nil :reader bridge-on-answered
+                :documentation "(lambda (leg)) for an ESTABLISHED bridge.")
+   (pending :initform '() :accessor bridge-pending
+            :documentation "Transfers being attempted on behalf of this bridge.")))
 
 (defun bridge-log (bridge control &rest args)
   (server-log (bridge-server bridge) "~a: ~?" (bridge-label bridge) control args))
@@ -220,17 +240,26 @@ bridge was given something else to do about it."
     (bridge-drop-forks bridge)
     (bridge-forget bridge)
     (bridge-log bridge "not answered (~(~a~))" reason)
-    (if (bridge-on-failed bridge)
-        (funcall (bridge-on-failed bridge) status reason)
-        (let ((a (bridge-a bridge)))
-          (sip:reject (leg-call a) status)
-          (leg-close a)))))
+    (cond ((bridge-on-failed bridge)
+           (funcall (bridge-on-failed bridge) status reason))
+          ((not (bridge-established-p bridge))
+           (let ((a (bridge-a bridge)))
+             (sip:reject (leg-call a) status)
+             (leg-close a))))))
+
+(defun bridge-abandon (bridge)
+  "Give up ringing for an established call, which carries on as it was."
+  (when (eq (bridge-state bridge) :calling)
+    (setf (bridge-state bridge) :ended)
+    (bridge-drop-forks bridge)
+    (bridge-forget bridge)))
 
 (defun bridge-end (bridge cause)
   "One side has gone: release the other and the media."
   (unless (member (bridge-state bridge) '(:failed :ended))
     (setf (bridge-state bridge) :ended)
     (bridge-forget bridge)
+    (mapc #'bridge-abandon (bridge-pending bridge))
     (let ((legs (bridge-legs bridge)))
       (setf (bridge-forks bridge) '())
       (dolist (leg legs)
@@ -243,12 +272,14 @@ bridge was given something else to do about it."
 phone make the ringback."
   (when (and (eq (bridge-state bridge) :calling) (not (bridge-rang bridge)))
     (setf (bridge-rang bridge) t)
-    (sip:ring (leg-call (bridge-a bridge)))))
+    (unless (bridge-established-p bridge)
+      (sip:ring (leg-call (bridge-a bridge))))))
 
 (defun bridge-early-media (bridge leg sdp)
   "A ringing leg is sending media before answering (announcements or
 ringback from a telephone network): let the caller hear it."
   (when (and (eq (bridge-state bridge) :calling)
+             (not (bridge-established-p bridge))
              (null (bridge-early bridge))
              (leg-accept-answer leg sdp))
     (let ((a (bridge-a bridge)))
@@ -264,6 +295,13 @@ ringback from a telephone network): let the caller hear it."
      (sip:hangup (leg-call leg)))
     ((not (leg-accept-answer leg sdp))
      (sip:hangup (leg-call leg)))
+    ((bridge-established-p bridge)
+     ;; A transfer target answered: this bridge has done its work, and the
+     ;; leg is handed to whoever asked for it.
+     (setf (bridge-state bridge) :ended)
+     (bridge-drop-forks bridge :headers *completed-elsewhere* :except leg)
+     (bridge-forget bridge)
+     (funcall (bridge-on-answered bridge) leg))
     (t
      (let ((a (bridge-a bridge)))
        (setf (bridge-state bridge) :connected
@@ -311,7 +349,8 @@ section 2.1), sendrecv again afterwards."
                    (sdp:hold (leg-local-sdp leg))
                    (sdp:resume (leg-local-sdp leg)))))
     (setf (leg-local-sdp leg) offer
-          (leg-sdp-text leg) (sdp:sdp-string offer))
+          (leg-sdp-text leg) (sdp:sdp-string offer)
+          (leg-told-held leg) (and held t))
     (sip:reinvite (leg-call leg) :sdp (leg-sdp-text leg))))
 
 (defun bridge-leg-offer (bridge leg sdp)
@@ -340,9 +379,11 @@ what it asks for, and pass a hold or resume on to the other party."
                 (when (and peer (eq (bridge-state bridge) :connected))
                   (leg-reoffer peer held)))))))))))
 
-(defun bridge-leg-event (bridge leg event &key sdp status &allow-other-keys)
+(defun bridge-leg-event (bridge leg event &key sdp status refer-to replaces notify
+                        &allow-other-keys)
   "Events of an established leg, either side."
   (case event
+    (:refer (bridge-transfer bridge leg refer-to replaces notify))
     (:reinvite (bridge-leg-offer bridge leg sdp))
     (:reinvite-accepted (when sdp (leg-accept-answer leg sdp)))
     (:reinvite-rejected
@@ -365,25 +406,29 @@ what it asks for, and pass a hold or resume on to the other party."
     (t (apply #'bridge-leg-event bridge (bridge-a bridge) event args))))
 
 (defun bridge-call (server a targets &key from headers (label "call") on-failed
+                                       established on-answered
                                        (ring-seconds (server-ring-seconds server)))
   "Ring TARGETS for the incoming call on leg A, whose offer has been
 answered already (LEG-ANSWER-OFFER), and join A to the first that answers.
 Each target is a plist: :URI where to send the INVITE, :TO the party being
 called, :TRUNK true when it is reached through the trunk.  FROM is who the
-call is from, as the called phones will see it."
+call is from, as the called phones will see it.
+
+With ESTABLISHED, A is a call already in progress (see the BRIDGE class):
+it is not touched, and ON-ANSWERED is called with the leg that answers."
   (let ((bridge (make-instance 'bridge :server server :a a :label label
-                                       :on-failed on-failed))
+                                       :on-failed on-failed
+                                       :established established
+                                       :on-answered on-answered))
         (ua (server-ua server)))
     (push bridge (server-bridges server))
-    ;; The bridge answers changes to either call itself, from what is asked.
-    (setf (sip:call-auto-answer-reinvite (leg-call a)) nil)
-    (setf (sip:call-on-event (leg-call a))
-          (lambda (call event &rest args)
-            (declare (ignore call))
-            (apply #'bridge-a-event bridge event args)))
+    (unless established
+      (setf (leg-party a) from)
+      (bridge-take-leg bridge a))
     (dolist (target targets)
       (let ((leg (server-open-leg server :trunk (getf target :trunk) :target target)))
         (push leg (bridge-forks bridge))
+        (setf (leg-party leg) (getf target :to))
         (setf (leg-call leg)
               (sip:invite ua (getf target :uri)
                           :auto-answer-reinvite nil
@@ -392,12 +437,136 @@ call is from, as the called phones will see it."
                           :headers (append headers (getf target :headers))
                           :on-event (lambda (call event &rest args)
                                       (declare (ignore call))
-                                      (apply #'bridge-fork-event bridge leg event args))))))
+                                      (apply #'bridge-fork-event bridge leg event args))))
+        (setf (sip:call-accept-refer (leg-call leg)) t)))
     (setf (bridge-timer bridge)
           (sip:schedule (sip:ua-scheduler ua) ring-seconds
                         (lambda () (bridge-fail bridge 480 :no-answer))))
     (bridge-log bridge "ringing ~d phone~:p" (length targets))
     bridge))
+
+;;; Transfer (RFC 5589; RFC 5359 sections 2.4 and 2.5)
+
+(defun bridge-take-leg (bridge leg)
+  "Make BRIDGE the owner of LEG's call: its events come here, and the
+bridge, not the SIP core, answers its re-INVITEs and REFERs."
+  (let ((call (leg-call leg)))
+    (setf (sip:call-auto-answer-reinvite call) nil
+          (sip:call-accept-refer call) t
+          (sip:call-on-event call)
+          (if (eq leg (bridge-a bridge))
+              (lambda (call event &rest args)
+                (declare (ignore call))
+                (apply #'bridge-a-event bridge event args))
+              (lambda (call event &rest args)
+                (declare (ignore call))
+                (apply #'bridge-fork-event bridge leg event args))))))
+
+(defun server-find-leg (server call)
+  "The bridge and leg CALL belongs to."
+  (dolist (bridge (server-bridges server))
+    (let ((leg (find call (bridge-legs bridge) :key #'leg-call)))
+      (when leg (return (values bridge leg))))))
+
+(defun bridge-replace-leg (bridge old new)
+  "Put NEW in OLD's place in a connected BRIDGE and release OLD: the party
+that stays is now talking to NEW."
+  (let ((keep (bridge-peer bridge old)))
+    (if (eq old (bridge-a bridge))
+        (setf (bridge-a bridge) new)
+        (setf (bridge-b bridge) new))
+    (bridge-take-leg bridge new)
+    (leg-disconnect old)
+    (setf (leg-held new) nil)
+    (legs-connect keep new)
+    ;; Whoever was told they were on hold by a party now gone is not any more.
+    (dolist (leg (list keep new))
+      (when (leg-told-held leg)
+        (leg-reoffer leg nil)))
+    ;; OLD's call is no longer this bridge's business.
+    (setf (sip:call-on-event (leg-call old)) nil)
+    (sip:hangup (leg-call old))
+    (leg-close old)
+    (bridge-log bridge "transferred: now ~a and ~a" (leg-label keep) (leg-label new))))
+
+(defun bridge-detach-leg (bridge leg)
+  "Take LEG out of a connected BRIDGE for use elsewhere; the bridge is
+dissolved and its other party released."
+  (let ((other (bridge-peer bridge leg)))
+    (setf (bridge-state bridge) :ended)
+    (bridge-forget bridge)
+    (mapc #'bridge-abandon (bridge-pending bridge))
+    (leg-disconnect leg)
+    (when other
+      (sip:hangup (leg-call other))
+      (leg-close other))
+    leg))
+
+(defun bridge-transfer (bridge leg refer-to replaces notify)
+  "The phone on LEG asked, with REFER, that the party it is talking to be
+connected to REFER-TO instead.  NOTIFY reports progress to that phone as SIP
+statuses (RFC 3515): the last report is final."
+  (let* ((server (bridge-server bridge))
+         (keep (bridge-peer bridge leg))
+         (uri (sip:name-addr-uri refer-to))
+         (number (normalize-number (uri-user uri))))
+    (cond
+      ((not (and keep (eq (bridge-state bridge) :connected)))
+       (funcall notify 481 t))
+      (replaces
+       ;; Attended: the Replaces names the transferring phone's other call
+       ;; with this server.  Join the two far parties (RFC 5589 section 7).
+       (multiple-value-bind (other-bridge other-leg)
+           (let ((call (sip:find-replaced-call (server-ua server) replaces)))
+             (and call (server-find-leg server call)))
+         (cond
+           ((and other-bridge (not (eq other-bridge bridge))
+                 (eq (bridge-state other-bridge) :connected))
+            (bridge-log bridge "attended transfer by ~a"
+                        (leg-label leg))
+            (funcall notify 200 t)
+            (bridge-replace-leg
+             bridge leg
+             (bridge-detach-leg other-bridge (bridge-peer other-bridge other-leg))))
+           (t (funcall notify 481 t)))))
+      (t
+       (let ((action (server-route server number)))
+         (bridge-log bridge "transfer by ~a to ~a" (leg-label leg)
+                     number)
+         (cond
+           ((and (consp action) (eq (first action) :extension))
+            (let ((targets (server-extension-targets server (second action))))
+              (cond
+                ((null targets) (funcall notify 480 t))
+                (t
+                 (push (bridge-call
+                        server keep targets
+                        :from (leg-party keep)
+                        :headers `(("Referred-By" ,(leg-party leg)))
+                        :label (format nil "transfer to ~a"
+                                       (extension-label (second action)))
+                        :ring-seconds (or (extension-ring-seconds (second action))
+                                          (server-ring-seconds server))
+                        :established t
+                        ;; The call being transferred carries on meanwhile,
+                        ;; and stays as it is if nobody answers.
+                        :on-failed (lambda (status reason)
+                                     (declare (ignore reason))
+                                     (funcall notify status t))
+                        :on-answered (lambda (new)
+                                       (funcall notify 200 t)
+                                       (if (eq (bridge-state bridge) :connected)
+                                           (bridge-replace-leg bridge leg new)
+                                           (progn (sip:hangup (leg-call new))
+                                                  (leg-close new)))))
+                       (bridge-pending bridge))))))
+           ((or (eq action :agent) (eq action :echo)
+                (and (consp action) (member (first action) '(:say :play))))
+            ;; Handed to the server itself: the agent, or an announcement.
+            (funcall notify 200 t)
+            (bridge-detach-leg bridge keep)
+            (server-attach-action server keep action))
+           (t (funcall notify 404 t))))))))
 
 ;;; Calls to extensions
 
@@ -499,8 +668,7 @@ the same user at another address)."
   "Answer the incoming call on leg A here and run the dialplan ACTION on it:
 the voice agent, the echo, an announcement."
   (let ((call (leg-call a))
-        (agent (eq action :agent))
-        (stop nil))
+        (agent (eq action :agent)))
     (cond
       ((and (consp action) (eq (first action) :reject))
        (sip:reject call (or (second action) 486))
@@ -513,20 +681,35 @@ the voice agent, the echo, an announcement."
        (sip:reject call 486)
        (leg-close a))
       (t
-       (when agent (incf (server-active-calls server)))
-       (setf (sip:call-auto-answer-reinvite call) t
-             (sip:call-on-event call)
-             (lambda (call event &key cause &allow-other-keys)
-               (case event
-                 (:established
-                  (setf stop (server-start-media server call action
-                                                 (leg-session a) (leg-codec a))))
-                 (:terminated
-                  (server-log server "call from ~a ended (~(~a~))" (call-caller call) cause)
-                  (when agent (decf (server-active-calls server)))
-                  (when stop (funcall stop))
-                  (leg-close a)))))
+       (server-attach-action server a action)
        (sip:answer call :sdp (leg-sdp-text a))))))
+
+(defun server-attach-action (server a action)
+  "Run the dialplan ACTION on leg A: when its call is established, or at
+once if it already is (a call transferred to the agent)."
+  (let ((call (leg-call a))
+        (agent (eq action :agent))
+        (stop nil))
+    (when agent (incf (server-active-calls server)))
+    (flet ((begin ()
+             (setf (leg-held a) nil
+                   stop (server-start-media server call action
+                                            (leg-session a) (leg-codec a)))))
+      (setf (sip:call-auto-answer-reinvite call) t
+            (sip:call-accept-refer call) nil
+            (sip:call-on-event call)
+            (lambda (call event &key cause &allow-other-keys)
+              (case event
+                (:established (begin))
+                (:terminated
+                 (server-log server "call from ~a ended (~(~a~))" (call-caller call) cause)
+                 (when agent (decf (server-active-calls server)))
+                 (when stop (funcall stop))
+                 (leg-close a)))))
+      (when (eq (sip:call-state call) :established)
+        (begin)
+        (when (leg-told-held a)
+          (leg-reoffer a nil))))))
 
 (defun server-deliver (server a number route)
   "Send the incoming call on leg A to NUMBER, wherever the dialplan and the

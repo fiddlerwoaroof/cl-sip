@@ -528,6 +528,184 @@ as a session description arrives."
       (is (= 482 (sip:call-status call)))
       (is (null (voice::server-bridges server))))))
 
+;;; Transfer (RFC 3515, RFC 5589; RFC 5359 sections 2.4 and 2.5)
+
+(defun progress-reports (events)
+  "The (status final) pairs of the :refer-progress events in EVENTS."
+  (loop for (name . args) in (funcall events)
+        when (eq name :refer-progress)
+          collect (list (getf args :status) (getf args :final))))
+
+(test unattended-transfer-rfc5359-2.4
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw")
+                    (carol "102" "carol-pw"))
+    (multiple-value-bind (on-bob bob-events) (recorder)
+      (let* ((caller (open-desk alice))
+             (bob-desk (attend bob :on-event on-bob))
+             (carol-desk (attend carol :after 1/4))
+             (call (dial caller server "101")))
+        (is-true (wait-for-call call :established))
+        (is-true (wait-for-call (desk-call bob-desk) :established))
+        ;; Bob, who was called, sends Alice on to Carol.
+        (sip:refer (desk-call bob-desk) (pbx-uri server "102"))
+        (is-true (sip:wait-until (lambda () (find :refer-accepted (funcall bob-events)
+                                                  :key #'car))))
+        ;; Carol's phone rings with Alice as the caller, sent by Bob.
+        (is-true (sip:wait-until (lambda () (desk-call carol-desk))))
+        (let ((invite (sip:call-invite (desk-call carol-desk))))
+          (is (string= "100" (sip:sip-uri-user (sip:name-addr-uri (sip:msg-from invite)))))
+          (is (search "sip:101@" (sip:header invite "Referred-By"))))
+        (is-true (wait-for-call (desk-call carol-desk) :established))
+        ;; Bob is told how it went, then released; Alice's call never changed.
+        (is-true (wait-for-call (desk-call bob-desk) :terminated))
+        (is (equal '((100 nil) (200 t)) (progress-reports bob-events)))
+        (is (eq :established (sip:call-state call)))
+        (say caller 5)
+        (is-true (hears carol-desk 5))
+        (say carol-desk 4)
+        (is-true (hears caller 4))
+        (is (zerop (desk-count bob-desk)))
+        (is (= 1 (length (voice::server-bridges server))))
+        (sip:hangup call)
+        (is-true (wait-for-call (desk-call carol-desk) :terminated))
+        (is-true (sip:wait-until (lambda () (null (voice::server-bridges server)))))))))
+
+(test failed-transfer-leaves-the-call-alone
+  (with-pbx (server (start-pbx :dialplan '((:default (:reject 404))))
+                    (alice "100" "alice-pw") (bob "101" "bob-pw") (carol "102" "carol-pw"))
+    (multiple-value-bind (on-alice alice-events) (recorder)
+      (let* ((caller (open-desk alice))
+             (bob-desk (attend bob))
+             (call (dial caller server "101" :on-event on-alice)))
+        (attend carol :status 486)
+        (is-true (wait-for-call call :established))
+        (is-true (wait-for-call (desk-call bob-desk) :established))
+        ;; This time the caller transfers, and Carol is busy.
+        (sip:refer call (pbx-uri server "102"))
+        (is-true (sip:wait-until
+                  (lambda () (equal '((100 nil) (486 t)) (progress-reports alice-events)))))
+        (is (eq :established (sip:call-state call)))
+        (is (eq :established (sip:call-state (desk-call bob-desk))))
+        (say caller 5)
+        (is-true (hears bob-desk 5))
+        ;; Nor does this dialplan have anything at 555.
+        (sip:refer call (pbx-uri server "555"))
+        (is-true (sip:wait-until
+                  (lambda () (equal '((100 nil) (486 t) (100 nil) (404 t))
+                                    (progress-reports alice-events)))))
+        (is (eq :established (sip:call-state call)))
+        (say caller 3)
+        (is-true (hears bob-desk 8))
+        (sip:hangup call)
+        (is-true (wait-for-call call :terminated))))))
+
+(test attended-transfer-rfc5359-2.5
+  (with-pbx (server (start-pbx) (alice "100" "alice-pw") (bob "101" "bob-pw")
+                    (carol "102" "carol-pw"))
+    (multiple-value-bind (on-alice alice-events) (recorder)
+      (multiple-value-bind (on-bob bob-events) (recorder)
+        (let* ((line-1 (open-desk alice))
+               (line-2 (open-desk alice))
+               (bob-desk (attend bob :on-event on-bob))
+               (carol-desk (attend carol))
+               (first-call (dial line-1 server "101" :on-event on-alice)))
+          (is-true (wait-for-call first-call :established))
+          (is-true (wait-for-call (desk-call bob-desk) :established))
+          ;; Alice holds Bob, calls Carol to ask, then joins the two.
+          (sip:reinvite first-call
+                        :sdp (sdp:sdp-string
+                              (sdp:hold (sdp:parse-sdp (sip:call-local-sdp first-call)))))
+          (is-true (sip:wait-until (lambda () (find :reinvite (funcall bob-events)
+                                                    :key #'car))))
+          (let ((second-call (dial line-2 server "102")))
+            (is-true (wait-for-call second-call :established))
+            (is-true (wait-for-call (desk-call carol-desk) :established))
+            (is (= 2 (length (voice::server-bridges server))))
+            (sip:refer first-call (pbx-uri server "102") :replaces second-call)
+            ;; Both of Alice's calls are released,
+            (is-true (wait-for-call first-call :terminated))
+            (is-true (wait-for-call second-call :terminated))
+            (is (equal '((100 nil) (200 t)) (progress-reports alice-events)))
+            ;; Bob is taken off hold,
+            (is-true (sip:wait-until
+                      (lambda () (= 2 (count :reinvite (funcall bob-events) :key #'car)))))
+            (is (eq :sendrecv
+                    (audio-direction
+                     (getf (cdr (find :reinvite (reverse (funcall bob-events)) :key #'car))
+                           :sdp))))
+            ;; and Bob and Carol are talking.
+            (is (eq :established (sip:call-state (desk-call bob-desk))))
+            (is (eq :established (sip:call-state (desk-call carol-desk))))
+            (is (= 1 (length (voice::server-bridges server))))
+            (say bob-desk 5)
+            (is-true (hears carol-desk 5))
+            (say carol-desk 4)
+            (is-true (hears bob-desk 4))
+            (sip:hangup (desk-call bob-desk))
+            (is-true (wait-for-call (desk-call carol-desk) :terminated))))))))
+
+(test transfer-to-the-agent
+  (with-pbx (server (start-pbx :greeting nil) (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let* ((caller (open-desk alice))
+           (bob-desk (attend bob))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :established))
+      (is-true (wait-for-call (desk-call bob-desk) :established))
+      ;; 700 is the spoken test line: Alice hears it, then it hangs up.
+      (sip:refer (desk-call bob-desk) (pbx-uri server "700"))
+      (is-true (wait-for-call (desk-call bob-desk) :terminated))
+      (is-true (hears caller 10))
+      (is-true (wait-for-call call :terminated))
+      (is (null (voice::server-bridges server))))))
+
+(test refer-rfc3515
+  ;; The protocol on its own, between two plain agents.
+  (multiple-value-bind (world alice bob incoming bob-events) (call-pair :on-incoming :answer)
+    (declare (ignorable bob))
+    (multiple-value-bind (on-event events) (recorder)
+      (let ((call (sip:invite alice *bob* :sdp *offer* :on-event on-event)))
+        (settle world)
+        (clear-wire world)
+        ;; Declined unless the application wants them.
+        (sip:refer call "sip:carol@chicago.example.com")
+        (settle world)
+        (is (equal '("REFER" "603/REFER") (wire world)))
+        (is (eq :refer-rejected (car (first (last (funcall events))))))
+        ;; Accepted: 202, an immediate NOTIFY, and the event.
+        (clear-wire world)
+        (setf (sip:call-accept-refer (funcall incoming)) t)
+        (sip:refer call "sip:carol@chicago.example.com" :replaces call)
+        (settle world)
+        (is (equal '("REFER" "202/REFER" "NOTIFY" "200/NOTIFY") (wire world)))
+        (let ((notify (first (wire-messages world "NOTIFY")))
+              (refer (cdr (first (last (funcall bob-events))))))
+          (is (alexandria:starts-with-subseq "refer;id=" (sip:header notify "Event")))
+          (is (search "active" (sip:header notify "Subscription-State")))
+          (is (string= "message/sipfrag" (sip:msg-content-type notify)))
+          (is (alexandria:starts-with-subseq "SIP/2.0 100 Trying"
+                                             (sip:message-body-string notify)))
+          (is (string= "carol" (sip:sip-uri-user
+                                (sip:name-addr-uri (getf refer :refer-to)))))
+          ;; The Replaces names the dialog from the far party's side.
+          (is (eq (funcall incoming)
+                  (sip:find-replaced-call bob (getf refer :replaces))))
+          ;; Progress and the final outcome.
+          (clear-wire world)
+          (funcall (getf refer :notify) 180)
+          (funcall (getf refer :notify) 200 t)
+          (settle world)
+          (is (equal '("NOTIFY" "NOTIFY" "200/NOTIFY" "200/NOTIFY") (wire world)))
+          (is (search "terminated" (sip:header (second (wire-messages world "NOTIFY"))
+                                               "Subscription-State")))
+          (is (equal '((100 nil) (180 nil) (200 t)) (progress-reports events))))
+        ;; Two Refer-To headers, or none, are an error (section 2.4.2).
+        (clear-wire world)
+        (let ((bad (sip::call-make-request call "REFER")))
+          (sip::ua-send alice bad (lambda (&rest args) (declare (ignore args)))
+                        :dialog (sip:call-dialog call)))
+        (settle world)
+        (is (equal '("REFER" "400/REFER") (wire world)))))))
+
 (defun audio-direction (sdp-text)
   (let ((session (sdp:parse-sdp sdp-text)))
     (sdp:media-direction (first (sdp:session-media session)) session)))

@@ -12,7 +12,7 @@ NIL matches any realm.")
    (outbound-proxy :initarg :outbound-proxy :initform nil :accessor ua-outbound-proxy)
    (user-agent-name :initarg :user-agent-name :initform "cl-sip/0.1"
                     :accessor ua-user-agent-name)
-   (methods :initform (list "INVITE" "ACK" "BYE" "CANCEL" "OPTIONS" "UPDATE")
+   (methods :initform (list "INVITE" "ACK" "BYE" "CANCEL" "OPTIONS" "UPDATE" "REFER" "NOTIFY")
             :accessor ua-methods)
    (dialog-owners :initform (make-hash-table :test #'equal) :reader ua-dialog-owners
                   :documentation "Dialog id -> the call that owns the dialog.")

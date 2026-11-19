@@ -170,7 +170,7 @@
       (sip:options alice *bob* :on-response (lambda (r) (setf response r)))
       (settle world)
       (is (= 200 (sip:response-status response)))
-      (is (equal '("INVITE" "ACK" "BYE" "CANCEL" "OPTIONS" "UPDATE")
+      (is (equal '("INVITE" "ACK" "BYE" "CANCEL" "OPTIONS" "UPDATE" "REFER" "NOTIFY")
                  (sip:header-values response "Allow")))
       (is (string= "application/sdp" (sip:header response "Accept")))
       (is (sip:msg-to-tag response))

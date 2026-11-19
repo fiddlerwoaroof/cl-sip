@@ -227,7 +227,14 @@ The phone that ends up ringing is told where the call has been
 (`History-Info`), and a call forwarded more than five times is taken for a
 loop and refused.
 
-The design and what is still to come (transfer, dialling out) are in
+Hold and transfer work from the phone's own buttons. A held party's phone
+is told it is on hold. A transfer, blind or after consulting the third
+party on a second call, is carried out by the server: the parties that
+remain are joined and the phone that transferred is released, or, if the
+target does not answer, the original call carries on. Calls can be
+transferred to the agent like any other number.
+
+The design and what is still to come (dialling out, busy lamps) are in
 `docs/pbx-plan.md`.
 
 ### Looking things up in the wiki
