@@ -868,7 +868,8 @@ event loop."
     (ecase reason
       (:unknown (format nil "There is no extension ~a." (spoken-digits number)))
       (:unavailable (format nil "~a is not available right now." who))
-      ((:busy :declined) (format nil "~a is on another call." who))
+      (:busy (format nil "~a is on another call." who))
+      (:declined (format nil "~a did not take the call." who))
       (:no-answer (format nil "~a is not answering." who))
       (:ringing "I am already putting you through.")
       (:gone "The call has ended."))))
