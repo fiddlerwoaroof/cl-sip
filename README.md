@@ -214,8 +214,21 @@ that are not extensions go to the dialplan as before, so the agent still
 answers anything else, and trunk callers can be routed to phones by listing
 your Flowroute number as a group, e.g. `("12065550100" :ring ("100"))`.
 
-The design and what is still to come (forwarding, transfer, dialling out)
-are in `docs/pbx-plan.md`.
+An extension can send its calls elsewhere: `:forward` always, `:busy` when
+its phone is busy or declines, `:no-answer` when nobody picks up within
+`:ring-seconds` (default `VOICE_RING_SECONDS`, 30) or no phone is registered.
+The target is another number or `:agent`:
+
+```lisp
+("101" :password "hunter2" :name "Bob" :busy "100" :no-answer :agent)
+```
+
+The phone that ends up ringing is told where the call has been
+(`History-Info`), and a call forwarded more than five times is taken for a
+loop and refused.
+
+The design and what is still to come (transfer, dialling out) are in
+`docs/pbx-plan.md`.
 
 ### Looking things up in the wiki
 

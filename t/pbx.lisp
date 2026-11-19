@@ -12,16 +12,18 @@
     ("102" :password "carol-pw" :name "Carol")))
 
 (defun start-pbx (&rest args &key (extensions *extensions*) &allow-other-keys)
+  ;; The caller's arguments come first, so they win over the defaults.
   (apply #'voice:start-server
-         :port 0 :tcp nil :log-stream nil :greeting nil
-         :extensions extensions
-         :stt (voice:make-function-stt (lambda (samples rate)
-                                         (declare (ignore samples rate)) nil))
-         :llm (voice:make-function-llm (lambda (messages)
-                                         (declare (ignore messages)) "Fine."))
-         :tts (voice:make-function-tts (lambda (text)
-                                         (declare (ignore text)) (tone 1600)))
-         (alexandria:remove-from-plist args :extensions)))
+         (append
+          (alexandria:remove-from-plist args :extensions)
+          (list :port 0 :tcp nil :log-stream nil :greeting nil
+                :extensions extensions
+                :stt (voice:make-function-stt (lambda (samples rate)
+                                                (declare (ignore samples rate)) nil))
+                :llm (voice:make-function-llm (lambda (messages)
+                                                (declare (ignore messages)) "Fine."))
+                :tts (voice:make-function-tts (lambda (text)
+                                                (declare (ignore text)) (tone 1600)))))))
 
 (defun pbx-uri (server &optional user)
   (format nil "sip:~@[~a@~]127.0.0.1:~d" user (voice:server-port server)))
@@ -420,6 +422,111 @@ as a session description arrives."
         (is-true (hears caller 10))
         (sip:hangup call)
         (is-true (wait-for-call call :terminated))))))
+
+;;; Forwarding (RFC 5359 sections 2.7 to 2.9) and History-Info (RFC 7044)
+
+(defun forwarding-extensions (&rest bob-options)
+  `(("100" :password "alice-pw" :name "Alice")
+    ("101" :password "bob-pw" :name "Bob" ,@bob-options)
+    ("102" :password "carol-pw" :name "Carol")))
+
+(defun history (call)
+  (sip:header-values (sip:call-invite call) "History-Info"))
+
+(test forward-unconditionally
+  (with-pbx (server (start-pbx :extensions (forwarding-extensions :forward "102"))
+                    (alice "100" "alice-pw") (bob "101" "bob-pw") (carol "102" "carol-pw"))
+    (let* ((caller (open-desk alice))
+           (bob-desk (attend bob))
+           (carol-desk (attend carol))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :established))
+      (is-true (wait-for-call (desk-call carol-desk) :established))
+      (is (null (desk-calls bob-desk)))
+      ;; Carol's phone can see the call was meant for Bob, and why it came
+      ;; to her: 101 (moved), then 102 as a different user, then her phone.
+      (let ((entries (history (desk-call carol-desk))))
+        (is (= 3 (length entries)))
+        (is (search "sip:101@" (first entries)))
+        (is (search "Reason=SIP%3Bcause%3D302" (first entries)))
+        (is (search ";index=1" (first entries)))
+        (is (search "sip:102@" (second entries)))
+        (is (search ";index=1.1;mp=1" (second entries)))
+        (is (search ";index=1.2;rc=1.1" (third entries))))
+      ;; She still sees Alice as the caller.
+      (is (string= "100" (sip:sip-uri-user
+                          (sip:name-addr-uri
+                           (sip:msg-from (sip:call-invite (desk-call carol-desk)))))))
+      (say caller 5)
+      (is-true (hears carol-desk 5))
+      (sip:hangup call)
+      (is-true (wait-for-call call :terminated)))))
+
+(test forward-when-busy
+  (with-pbx (server (start-pbx :extensions (forwarding-extensions :busy "102"))
+                    (alice "100" "alice-pw") (bob "101" "bob-pw") (carol "102" "carol-pw"))
+    (let* ((caller (open-desk alice))
+           (bob-desk (attend bob :status 486))
+           (carol-desk (attend carol))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :established))
+      (is (= 1 (length (desk-calls bob-desk))))
+      ;; Bob's own phone was told nothing of a forward; Carol's is.
+      (is (= 2 (length (history (desk-call bob-desk)))))
+      (is (search "cause%3D486" (first (history (desk-call carol-desk)))))
+      (sip:hangup call)
+      (is-true (wait-for-call call :terminated)))))
+
+(test forward-on-no-answer-to-the-agent
+  (with-pbx (server (start-pbx :extensions (forwarding-extensions :no-answer :agent
+                                                                  :ring-seconds 1/2)
+                               :greeting "Hello.")
+                    (alice "100" "alice-pw") (bob "101" "bob-pw"))
+    (let* ((caller (open-desk alice))
+           (bob-desk (attend bob :after nil))
+           (call (dial caller server "101")))
+      ;; Bob does not pick up, so the server answers and the agent greets
+      ;; Alice (1600 samples of stand-in speech: ten packets).
+      (is-true (wait-for-call call :established))
+      (is-true (wait-for-call (desk-call bob-desk) :terminated))
+      (is-true (hears caller 10))
+      (is (= 1 (voice::server-active-calls server)))
+      (sip:hangup call)
+      (is-true (wait-for-call call :terminated))
+      (is-true (sip:wait-until (lambda () (zerop (voice::server-active-calls server))))))))
+
+(test forward-when-unreachable-and-to-the-dialplan
+  ;; Nobody is registered as Bob: the no-answer target applies at once.
+  (with-pbx (server (start-pbx :extensions (forwarding-extensions :no-answer "102"))
+                    (alice "100" "alice-pw") (carol "102" "carol-pw"))
+    (let* ((caller (open-desk alice))
+           (carol-desk (attend carol))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :established))
+      (is (search "cause%3D480" (first (history (desk-call carol-desk)))))
+      (sip:hangup call)
+      (is-true (wait-for-call call :terminated))))
+  ;; A target need not be an extension: 700 is the spoken test line, which
+  ;; talks and then hangs up.
+  (with-pbx (server (start-pbx :extensions (forwarding-extensions :forward "700"))
+                    (alice "100" "alice-pw"))
+    (let* ((caller (open-desk alice))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :established))
+      (is-true (hears caller 10))
+      (is-true (wait-for-call call :terminated))
+      (is (eq :remote-hangup (sip:call-cause call))))))
+
+(test forwarding-loops-end
+  (with-pbx (server (start-pbx :extensions '(("100" :password "alice-pw")
+                                             ("101" :password "bob-pw" :forward "102")
+                                             ("102" :password "carol-pw" :forward "101")))
+                    (alice "100" "alice-pw"))
+    (let* ((caller (open-desk alice))
+           (call (dial caller server "101")))
+      (is-true (wait-for-call call :terminated))
+      (is (= 482 (sip:call-status call)))
+      (is (null (voice::server-bridges server))))))
 
 (defun audio-direction (sdp-text)
   (let ((session (sdp:parse-sdp sdp-text)))

@@ -389,7 +389,7 @@ call is from, as the called phones will see it."
                           :auto-answer-reinvite nil
                           :to (getf target :to) :from from
                           :sdp (leg-make-offer server leg)
-                          :headers headers
+                          :headers (append headers (getf target :headers))
                           :on-event (lambda (call event &rest args)
                                       (declare (ignore call))
                                       (apply #'bridge-fork-event bridge leg event args))))))
@@ -418,9 +418,10 @@ authenticated, or for a trunk call the number the provider gave."
         (server-identity server (normalize-number (call-caller-number call))
                          (sip:name-addr-display-name from)))))
 
-(defun server-extension-targets (server extension)
+(defun server-extension-targets (server extension &optional route)
   "Every phone that should ring for EXTENSION: its registered contacts, or
-for a group those of each member."
+for a group those of each member.  With ROUTE, each target carries the
+History-Info of the call so far."
   (let ((ua (server-ua server)))
     (loop for member in (if (extension-group-p extension)
                             (mapcar (lambda (number)
@@ -432,25 +433,162 @@ for a group those of each member."
                        collect (list :uri uri
                                      :to (server-identity server (extension-number member)
                                                           (extension-name member))
-                                     :extension member)))))
+                                     :extension member
+                                     :headers (and route (route-headers route uri)))))))
 
-(defun server-ring-extension (server a extension)
-  "Ring EXTENSION for the incoming call on leg A."
-  (let ((targets (server-extension-targets server extension))
-        (call (leg-call a)))
-    (cond ((null targets)
-           (server-log server "  ~a has no phone registered" (extension-label extension))
-           (sip:reject call 480)
-           (leg-close a))
-          (t
-           (bridge-call server a targets
-                        :from (call-identity server call)
-                        :label (format nil "~a -> ~a"
-                                       (sip:uri-string
-                                        (sip:name-addr-uri (call-identity server call)))
-                                       (extension-label extension))
-                        :ring-seconds (or (extension-ring-seconds extension)
-                                          (server-ring-seconds server)))))))
+;;; Where a call has been (RFC 7044)
+
+(defstruct route
+  "The targets an incoming call has been sent to, oldest first.  Each entry
+is a plist: :URI, :INDEX, :CAUSE (why the call left that target, a SIP
+status) and :MP (the index of the entry it was retargeted from)."
+  (entries '())
+  (counter 0))
+
+(defparameter *max-forwards* 5
+  "How many times one call may be forwarded before it is taken for a loop.")
+
+(defun route-current (route)
+  (first (last (route-entries route))))
+
+(defun route-forwards (route)
+  (max 0 (1- (length (route-entries route)))))
+
+(defun route-next-index (route)
+  ;; Everything this server adds hangs off the entry for the number dialled
+  ;; (RFC 7044 section 10.3).
+  (format nil "1.~d" (incf (route-counter route))))
+
+(defun route-start (server number)
+  (make-route :entries (list (list :uri (sip:uri-string
+                                         (sip:name-addr-uri (server-identity server number)))
+                                   :index "1"))))
+
+(defun route-retarget (route server number cause)
+  "Record that the call is leaving its current target for NUMBER, a
+different user, because of CAUSE."
+  (let ((from (route-current route)))
+    (setf (route-entries route)
+          (append (butlast (route-entries route))
+                  (list (list :uri (getf from :uri) :index (getf from :index)
+                              :mp (getf from :mp) :cause cause)
+                        (list :uri (sip:uri-string
+                                    (sip:name-addr-uri (server-identity server number)))
+                              :index (route-next-index route)
+                              :mp (getf from :index)))))
+    route))
+
+(defun route-headers (route contact)
+  "History-Info for an INVITE sent to CONTACT, a registered address of the
+route's current target: the entries so far, then one for this hop (\"rc\":
+the same user at another address)."
+  (append
+   (loop for entry in (route-entries route)
+         collect (list "History-Info"
+                       (format nil "<~a~@[?Reason=SIP%3Bcause%3D~d~]>;index=~a~@[;mp=~a~]"
+                               (getf entry :uri) (getf entry :cause)
+                               (getf entry :index) (getf entry :mp))))
+   (list (list "History-Info"
+               (format nil "<~a>;index=~a;rc=~a" (sip:uri-string contact)
+                       (route-next-index route)
+                       (getf (route-current route) :index))))))
+
+;;; Delivering a call: ring, forward, or answer here
+
+(defun server-answer-with (server a action)
+  "Answer the incoming call on leg A here and run the dialplan ACTION on it:
+the voice agent, the echo, an announcement."
+  (let ((call (leg-call a))
+        (agent (eq action :agent))
+        (stop nil))
+    (cond
+      ((and (consp action) (eq (first action) :reject))
+       (sip:reject call (or (second action) 486))
+       (leg-close a))
+      ((or (null action) (functionp action))
+       (sip:reject call 404)
+       (leg-close a))
+      ((and agent (>= (server-active-calls server) (server-max-calls server)))
+       (server-log server "  too many calls in progress")
+       (sip:reject call 486)
+       (leg-close a))
+      (t
+       (when agent (incf (server-active-calls server)))
+       (setf (sip:call-auto-answer-reinvite call) t
+             (sip:call-on-event call)
+             (lambda (call event &key cause &allow-other-keys)
+               (case event
+                 (:established
+                  (setf stop (server-start-media server call action
+                                                 (leg-session a) (leg-codec a))))
+                 (:terminated
+                  (server-log server "call from ~a ended (~(~a~))" (call-caller call) cause)
+                  (when agent (decf (server-active-calls server)))
+                  (when stop (funcall stop))
+                  (leg-close a)))))
+       (sip:answer call :sdp (leg-sdp-text a))))))
+
+(defun server-deliver (server a number route)
+  "Send the incoming call on leg A to NUMBER, wherever the dialplan and the
+extension list say that is."
+  (let ((action (server-route server number)))
+    (cond
+      ((> (route-forwards route) *max-forwards*)
+       (server-log server "  forwarded too many times; giving up")
+       (sip:reject (leg-call a) 482)
+       (leg-close a))
+      ((and (consp action) (eq (first action) :extension))
+       (server-ring-extension server a (second action) route))
+      (t (server-answer-with server a action)))))
+
+(defun server-forward (server a extension target cause route)
+  "The call for EXTENSION goes to TARGET instead: a number, or :AGENT."
+  (server-log server "  ~a -> ~(~a~) (~a)" (extension-label extension) target
+              (sip:reason-phrase cause))
+  (cond ((eq target :agent)
+         (server-answer-with server a :agent))
+        (t
+         (server-deliver server a target
+                         (route-retarget route server target cause)))))
+
+(defun server-ring-extension (server a extension &optional
+                                                   (route (route-start
+                                                           server (extension-number extension))))
+  "Ring EXTENSION for the incoming call on leg A, or send the call on as
+the extension's forwarding says (RFC 5359 sections 2.7 to 2.9)."
+  (let ((call (leg-call a)))
+    (flet ((failed (status reason)
+             (let ((target (ecase reason
+                             ((:busy :declined) (extension-busy extension))
+                             ((:no-answer :unavailable) (extension-no-answer extension)))))
+               (cond (target
+                      (server-forward server a extension target
+                                      (ecase reason
+                                        (:busy 486) (:declined 603)
+                                        (:no-answer 408) (:unavailable 480))
+                                      route))
+                     (t
+                      (sip:reject call status)
+                      (leg-close a))))))
+      (cond
+        ((extension-forward extension)
+         (server-forward server a extension (extension-forward extension) 302 route))
+        (t
+         (let ((targets (server-extension-targets server extension route)))
+           (cond
+             ((null targets)
+              (server-log server "  ~a has no phone registered" (extension-label extension))
+              (failed 480 :unavailable))
+             (t
+              (bridge-call server a targets
+                           :from (call-identity server call)
+                           :label (format nil "~a -> ~a"
+                                          (sip:uri-string
+                                           (sip:name-addr-uri (call-identity server call)))
+                                          (extension-label extension))
+                           :ring-seconds (or (extension-ring-seconds extension)
+                                             (server-ring-seconds server))
+                           :on-failed #'failed)))))))))
 
 (defun server-call-extension (server call extension)
   "Dialplan action for a call to EXTENSION."
