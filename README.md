@@ -162,7 +162,7 @@ router. Pick one:
 
 | Option | Setting | Notes |
 |---|---|---|
-| Port forwarding | `VOICE_RTP_PORTS=40000-40019`, and forward that UDP range to this machine | Dependable. Two ports are not needed per call; one is. |
+| Port forwarding | `VOICE_RTP_PORTS=40000-40019`, and forward that UDP range to this machine | Dependable. Each call uses one port from the range. |
 | STUN | `VOICE_STUN=host:port` | No router changes; does not work behind routers that give each destination a different port. |
 | Neither | | Works only if the router keeps port numbers unchanged. |
 
