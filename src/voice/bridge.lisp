@@ -716,17 +716,43 @@ the voice agent, the echo, an announcement."
        (server-attach-action server a action)
        (sip:answer call :sdp (leg-sdp-text a))))))
 
+(defparameter *digit-pause* 3
+  "Seconds without a key press after which the digits keyed so far are
+taken to be the whole number.")
+
+(defstruct handoff
+  "A call the agent is on, whose caller can be put through to an extension
+(see below: handing a call from the agent to a phone)."
+  server leg agent release
+  (digits "")
+  (timer nil)
+  (bridge nil))                         ; ringing for the caller, if any
+
 (defun server-attach-action (server a action)
   "Run the dialplan ACTION on leg A: when its call is established, or at
 once if it already is (a call transferred to the agent)."
-  (let ((call (leg-call a))
-        (agent (eq action :agent))
-        (stop nil))
+  (let* ((call (leg-call a))
+         (agent (eq action :agent))
+         (stop nil)
+         (released nil)
+         (handoff (and agent (server-extensions server)
+                       (make-handoff :server server :leg a))))
     (when agent (incf (server-active-calls server)))
-    (flet ((begin ()
-             (setf (leg-held a) nil
-                   stop (server-start-media server call action
-                                            (leg-session a) (leg-codec a)))))
+    (labels ((begin ()
+               (setf (leg-held a) nil
+                     stop (server-start-media
+                           server call action (leg-session a) (leg-codec a)
+                           :agent-options (and handoff (handoff-agent-options handoff a))
+                           :on-agent (and handoff
+                                          (lambda (agent)
+                                            (setf (handoff-agent handoff) agent))))))
+             (release ()
+               ;; The server's own part in the call is over.
+               (unless released
+                 (setf released t)
+                 (when agent (decf (server-active-calls server)))
+                 (when stop (funcall stop)))))
+      (when handoff (setf (handoff-release handoff) #'release))
       (setf (sip:call-auto-answer-reinvite call) nil
             (sip:call-accept-refer call) nil
             (sip:call-on-event call)
@@ -741,13 +767,230 @@ once if it already is (a call transferred to the agent)."
                        (t (sip:reject call 488))))
                 (:terminated
                  (server-log server "call from ~a ended (~(~a~))" (call-caller call) cause)
-                 (when agent (decf (server-active-calls server)))
-                 (when stop (funcall stop))
+                 (when handoff (handoff-cancel handoff))
+                 (release)
                  (leg-close a)))))
       (when (eq (sip:call-state call) :established)
         (begin)
         (when (leg-told-held a)
           (leg-reoffer a nil))))))
+
+;;; Handing a call from the agent to a phone
+;;;
+;;; A caller talking to the agent can be put through to an extension: by
+;;; keying its number, or by asking, which the model acts on with a tool.
+;;; The extension rings while the caller stays with the agent; when a phone
+;;; answers the agent leaves and the two are bridged, and when none does the
+;;; agent carries on.  Only listed extensions and groups can be reached this
+;;; way: the agent never dials out.
+
+(defun bridge-join (server a b label)
+  "Bridge two legs whose calls are both established."
+  (let ((bridge (make-instance 'bridge :server server :a a :label label)))
+    (setf (bridge-state bridge) :connected
+          (bridge-b bridge) b
+          (leg-held b) nil)
+    (push bridge (server-bridges server))
+    (bridge-take-leg bridge a)
+    (bridge-take-leg bridge b)
+    (legs-connect a b)
+    (bridge-log bridge "connected")
+    (server-publish-dialogs server)
+    bridge))
+
+(defun handoff-cancel (handoff)
+  "The caller has gone: stop ringing on their behalf."
+  (sip:cancel-timer (handoff-timer handoff))
+  (when (handoff-bridge handoff)
+    (bridge-abandon (shiftf (handoff-bridge handoff) nil))))
+
+(defun handoff-start (handoff number on-result)
+  "Ring the extension NUMBER for the caller who is talking to the agent.
+Returns NIL when ringing has started; ON-RESULT is then called with
+:ANSWERED, after which the two are talking and the agent has left, or with
+why not (:BUSY, :DECLINED, :NO-ANSWER, :UNAVAILABLE).  When ringing cannot
+start, returns the reason instead (:UNKNOWN, :UNAVAILABLE, :RINGING, :GONE)
+and, as a second value, the extension if there is one.  Runs on the SIP
+event loop."
+  (let* ((server (handoff-server handoff))
+         (a (handoff-leg handoff))
+         (call (leg-call a))
+         (action (server-route server number))
+         (extension (and (consp action) (eq (first action) :extension) (second action))))
+    (cond
+      ((handoff-bridge handoff) (values :ringing extension))
+      ((not (eq (sip:call-state call) :established)) :gone)
+      ((null extension) :unknown)
+      (t
+       (let ((targets (server-extension-targets server extension))
+             (label (format nil "~a -> ~a"
+                            (sip:uri-string (sip:name-addr-uri (call-identity server call)))
+                            (extension-label extension))))
+         (cond
+           ((null targets) (values :unavailable extension))
+           (t
+            (server-log server "  putting the caller through to ~a"
+                        (extension-label extension))
+            (setf (leg-party a) (call-identity server call)
+                  (leg-extension a) (call-caller-extension call)
+                  (handoff-bridge handoff)
+                  (bridge-call
+                   server a targets
+                   :from (call-identity server call)
+                   :label label
+                   :ring-seconds (or (extension-ring-seconds extension)
+                                     (server-ring-seconds server))
+                   :established t
+                   :on-failed (lambda (status reason)
+                                (declare (ignore status))
+                                (setf (handoff-bridge handoff) nil)
+                                (funcall on-result reason))
+                   :on-answered (lambda (new)
+                                  (setf (handoff-bridge handoff) nil)
+                                  (cond
+                                    ((eq (sip:call-state call) :established)
+                                     (funcall on-result :answered)
+                                     (funcall (handoff-release handoff))
+                                     (bridge-join server a new label))
+                                    (t (sip:hangup (leg-call new))
+                                       (leg-close new))))))
+            (values nil extension))))))))
+
+(defun spoken-digits (number)
+  "NUMBER as it should be read out: digit by digit."
+  (format nil "~{~a~^ ~}" (coerce number 'list)))
+
+(defun handoff-wording (reason number extension)
+  "What the caller is told when they cannot be put through."
+  (let ((who (if (and extension (extension-name extension))
+                 (extension-name extension)
+                 (format nil "extension ~a" (spoken-digits number)))))
+    (ecase reason
+      (:unknown (format nil "There is no extension ~a." (spoken-digits number)))
+      (:unavailable (format nil "~a is not available right now." who))
+      ((:busy :declined) (format nil "~a is on another call." who))
+      (:no-answer (format nil "~a is not answering." who))
+      (:ringing "I am already putting you through.")
+      (:gone "The call has ended."))))
+
+(defun handoff-ring-seconds (handoff extension)
+  (ceiling (or (and extension (extension-ring-seconds extension))
+               (server-ring-seconds (handoff-server handoff)))))
+
+;; By keypad
+
+(defun handoff-dial (handoff)
+  "Ring the number keyed so far."
+  (let ((agent (handoff-agent handoff))
+        (number (shiftf (handoff-digits handoff) "")))
+    (sip:cancel-timer (handoff-timer handoff))
+    (when (and agent (plusp (length number)))
+      (let (extension)
+        (flet ((result (reason)
+                 (unless (eq reason :answered)
+                   (agent-resume agent)
+                   (agent-say agent (format nil "~a Is there anything else I can do?"
+                                            (handoff-wording reason number extension))))))
+          (multiple-value-bind (problem found) (handoff-start handoff number #'result)
+            (setf extension found)
+            (cond
+              ((eq problem :ringing))
+              (problem
+               (agent-say agent (handoff-wording problem number extension)))
+              (t
+               (agent-wait agent)
+               (agent-say agent (format nil "Calling ~a."
+                                        (or (extension-name extension)
+                                            (format nil "extension ~a"
+                                                    (spoken-digits number)))))
+               (agent-post agent (list :ringback
+                                       (handoff-ring-seconds handoff extension)))))))))))
+
+(defun handoff-key (handoff key)
+  "The caller pressed KEY.  Digits collect into a number, which is rung as
+soon as it can only be one extension, at #, or after a pause; * starts over.
+Runs on the SIP event loop."
+  (let ((server (handoff-server handoff)))
+    (sip:cancel-timer (handoff-timer handoff))
+    (cond
+      ((handoff-bridge handoff))          ; already ringing someone
+      ((char= key #\*) (setf (handoff-digits handoff) ""))
+      ((char= key #\#) (handoff-dial handoff))
+      ((digit-char-p key)
+       (let* ((digits (setf (handoff-digits handoff)
+                            (concatenate 'string (handoff-digits handoff) (string key))))
+              (possible (remove-if-not
+                         (lambda (extension)
+                           (alexandria:starts-with-subseq digits (extension-number extension)))
+                         (server-extensions server))))
+         (if (and possible
+                  (or (rest possible)
+                      (string/= digits (extension-number (first possible)))))
+             ;; It may yet become one of several numbers: wait for more.
+             (setf (handoff-timer handoff)
+                   (sip:schedule (sip:ua-scheduler (server-ua server)) *digit-pause*
+                                 (lambda () (handoff-dial handoff))))
+             ;; One extension exactly, or none at all, which is said at once.
+             (handoff-dial handoff)))))))
+
+;; By asking
+
+(defun handoff-directory (server)
+  "The extensions a caller can be put through to, for the model."
+  (format nil "You can put the caller through to one of these extensions with ~
+the transfer_call tool, when they ask for a person, a group or an extension ~
+number.  Say that you are putting them through before you call the tool, and ~
+nothing after it succeeds.  If it fails, tell them and offer to help ~
+otherwise.  You cannot call any other number.  Extensions: ~
+~{~a~^; ~}."
+          (loop for extension in (server-extensions server)
+                collect (format nil "~a~@[ (~a)~]" (extension-number extension)
+                                (extension-name extension)))))
+
+(defun handoff-tool (handoff)
+  "The tool with which the model puts the caller through."
+  (make-function-tool
+   "transfer_call"
+   "Put the caller through to an extension.  It rings while the caller waits, and returns when someone answers or nobody does."
+   (lambda (input)
+     (let* ((server (handoff-server handoff))
+            (agent (handoff-agent handoff))
+            (number (normalize-number (princ-to-string (gethash "extension" input ""))))
+            (outcome nil))
+       (multiple-value-bind (problem extension)
+           (sip:call-on-loop (sip:ua-scheduler (server-ua server))
+                             (lambda ()
+                               (handoff-start handoff number
+                                              (lambda (reason) (setf outcome reason)))))
+         (cond
+           (problem (handoff-wording problem number extension))
+           (t
+            (agent-wait agent)
+            (agent-ringback agent (handoff-ring-seconds handoff extension))
+            (loop until (or outcome (not (agent-running agent)))
+                  do (sleep 1/20))
+            (cond ((eq outcome :answered) "The caller has been put through.")
+                  ((null outcome) "The call has ended.")
+                  (t
+                   (agent-resume agent)
+                   (handoff-wording outcome number extension))))))))
+   :schema (json-object
+            "type" "object"
+            "properties" (json-object
+                          "extension" (json-object
+                                       "type" "string"
+                                       "description" "The extension number, such as 101."))
+            "required" (vector "extension"))
+   :instructions (handoff-directory (handoff-server handoff))))
+
+(defun handoff-agent-options (handoff leg)
+  "START-AGENT arguments that let the caller on LEG be put through."
+  (let ((scheduler (sip:ua-scheduler (server-ua (handoff-server handoff)))))
+    (list :tools (list (handoff-tool handoff))
+          :event-type (leg-event-type leg)
+          :on-digit (lambda (key)
+                      ;; From the RTP thread to the SIP event loop.
+                      (sip:post scheduler (lambda () (handoff-key handoff key)))))))
 
 (defun server-deliver (server a number route &optional on-behalf-of)
   "Send the incoming call on leg A to NUMBER, wherever the dialplan and the

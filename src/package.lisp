@@ -47,7 +47,7 @@
    #:generate-challenge #:verify-credentials #:algorithm-supported-p
 
    ;; event loop
-   #:scheduler #:make-scheduler #:now #:schedule #:cancel-timer #:post
+   #:scheduler #:make-scheduler #:now #:schedule #:cancel-timer #:post #:call-on-loop
    #:pump #:advance-time #:start-scheduler #:stop-scheduler
 
    ;; stack and transports

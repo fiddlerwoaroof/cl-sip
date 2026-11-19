@@ -234,6 +234,19 @@ remain are joined and the phone that transferred is released, or, if the
 target does not answer, the original call carries on. Calls can be
 transferred to the agent like any other number.
 
+The agent can put a caller through to an extension. The caller either keys
+the number (`#` ends it, `*` starts over) or asks for a person, a group or a
+number, which the model acts on with its `transfer_call` tool; it is told
+the numbers and names in the list. The caller hears ringing while the
+phones ring. When one answers, the agent leaves the call; when none does,
+the agent says so and carries on. Only listed extensions and groups can be
+reached this way, never an outside number. To make the agent an attendant
+for calls from outside, give it a fitting greeting:
+
+```sh
+export VOICE_GREETING="Hello. Which extension should I dial?"
+```
+
 To let phones call telephone numbers through the trunk, set
 `VOICE_OUTBOUND_CALLER_ID` to one of your Flowroute numbers and mark the
 extensions that may do so:

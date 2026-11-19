@@ -30,6 +30,7 @@
 #     VOICE_EXTENSIONS         file listing the extensions (extensions.lisp when
 #                              present); see docs/pbx-plan.md for the format
 #     VOICE_RING_SECONDS       how long an extension rings (default 30)
+#     VOICE_GREETING           what the agent says when it answers
 #     VOICE_WIKI_TOKEN         capability token for the LLM-wiki MCP server; with
 #                              it the agent can look things up in the wiki
 #     VOICE_WIKI_URL           that server's address (http://localhost:8788/mcp)

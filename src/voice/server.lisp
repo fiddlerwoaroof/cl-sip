@@ -229,17 +229,21 @@ sends the INVITE again with credentials."
        (sip:hangup call)))
     out))
 
-(defun server-start-media (server call action session codec)
-  "Start ACTION on an established call.  Returns a function that stops it."
+(defun server-start-media (server call action session codec &key agent-options on-agent)
+  "Start ACTION on an established call.  Returns a function that stops it.
+AGENT-OPTIONS are further arguments for START-AGENT, and ON-AGENT is called
+with the agent once it has started."
   (cond
     ((eq action :agent)
-     (let ((agent (start-agent session
-                               :stt (server-stt server) :llm (server-llm server)
-                               :tts (server-tts server) :codec codec
-                               :greeting (server-greeting server)
-                               :barge-in (server-barge-in server)
-                               :log (lambda (who text)
-                                      (server-log server "~(~a~): ~a" who text)))))
+     (let ((agent (apply #'start-agent session
+                         :stt (server-stt server) :llm (server-llm server)
+                         :tts (server-tts server) :codec codec
+                         :greeting (server-greeting server)
+                         :barge-in (server-barge-in server)
+                         :log (lambda (who text)
+                                (server-log server "~(~a~): ~a" who text))
+                         agent-options)))
+       (when on-agent (funcall on-agent agent))
        (lambda () (stop-agent agent))))
     ((eq action :echo)
      (setf (rtp:rtp-session-on-packet session)
@@ -517,6 +521,7 @@ said (names and snippets only; read a page before relying on it):"))
   VOICE_EXTENSIONS              file with the extension list (extensions.lisp
                                 when there is one)
   VOICE_RING_SECONDS            how long an extension rings (30)
+  VOICE_GREETING                what the agent says when it answers
   VOICE_OUTBOUND_CALLER_ID      your number at the provider; setting it lets
                                 extensions marked :outbound dial out
   VOICE_WIKI_TOKEN              capability token for the LLM-wiki MCP server;
@@ -536,6 +541,7 @@ OVERRIDES are START-SERVER keyword arguments that take precedence."
     (apply #'start-server
            (append
             overrides
+            (and (env "VOICE_GREETING") (list :greeting (env "VOICE_GREETING")))
             (list :host (or (env "VOICE_HOST") (if trunk "0.0.0.0" "127.0.0.1"))
                   :port (parse-integer (or (env "VOICE_PORT") "5060"))
                   :allow (env-list "VOICE_ALLOW")

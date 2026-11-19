@@ -159,6 +159,26 @@ as the voice tests do. No phase needs a real softphone or the real trunk.
 - Subscribers authenticate as an extension; any extension may watch any
   other.
 
+### Phase 8 — The agent as attendant
+
+- A caller talking to the agent can be put through to an extension or
+  group, by keypad (RFC 4733 telephone events) or by asking.
+- Keypad: digits collect into a number that is rung as soon as it can only
+  be one extension, at `#`, or three seconds after the last key; `*` starts
+  over. A number no extension begins with is refused at once.
+- Asking: the model gets a `transfer_call` tool for the length of the call,
+  and the list of numbers and names in its instructions.
+- The extension rings for the established call, as in an unattended
+  transfer. Meanwhile the caller hears ringing made by the server and the
+  agent does not listen. On answer the agent leaves and the two legs are
+  bridged; otherwise the agent says why and carries on.
+- Only extensions and groups: the agent never dials out, whatever the
+  caller says.
+- Not done: the extension's own forwarding is not followed (as with
+  transfers); keys sent as audio tones rather than telephone events are
+  not recognised; the agent does not introduce the caller to whoever
+  answers.
+
 ### Not planned yet
 
 - Message waiting (RFC 3842): needs voicemail, which does not exist. The
@@ -193,3 +213,4 @@ look at first when that happens:
 | 5 Transfer | done, except INVITE with Replaces |
 | 6 Dialling out | done in simulation; not yet tried against Flowroute |
 | 7 Events | done |
+| 8 The agent as attendant | done |

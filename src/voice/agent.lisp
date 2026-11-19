@@ -18,6 +18,18 @@
    (llm :initarg :llm :reader agent-llm)
    (tts :initarg :tts :reader agent-tts)
    (barge-in :initarg :barge-in :initform t :reader agent-barge-in)
+   (tools :initarg :tools :initform '() :reader agent-tools
+          :documentation "Tool providers for this call only (see *CALL-TOOLS*).")
+   (event-type :initarg :event-type :initform nil :reader agent-event-type
+               :documentation "Payload type of telephone events on the call, if any.")
+   (on-digit :initarg :on-digit :initform nil :reader agent-on-digit
+             :documentation "(lambda (character)) called once for each key the
+caller presses.")
+   (last-event :initform nil :accessor agent-last-event
+               :documentation "RTP timestamp of the key press last reported.")
+   (waiting :initform nil :accessor agent-waiting
+            :documentation "True while the caller is waiting for someone to pick
+up: what they say meanwhile is not for the agent.")
    (log :initarg :log :initform nil :reader agent-log
         :documentation "(lambda (who text)) called for each thing said; WHO is
 :caller, :agent or :error.")
@@ -65,11 +77,29 @@ an older generation is discarded.")
 
 ;;; Incoming audio (RTP receive thread)
 
+(defun agent-handle-key (agent packet)
+  "A telephone event (RFC 4733).  One key press arrives as several packets
+with the same timestamp; it is reported once."
+  (let ((event (ignore-errors
+                (rtp:decode-telephone-event (rtp:rtp-packet-payload packet))))
+        (timestamp (rtp:rtp-packet-timestamp packet)))
+    (when (and event (not (eql timestamp (agent-last-event agent))))
+      (setf (agent-last-event agent) timestamp)
+      (let ((key (rtp:dtmf-event-char (rtp:telephone-event-event event))))
+        (when (and key (agent-on-digit agent))
+          ;; A caller who starts dialling has stopped listening.
+          (unless (agent-waiting agent) (agent-interrupt agent))
+          (ignore-errors (funcall (agent-on-digit agent) key)))))))
+
 (defun agent-handle-packet (agent packet)
+  (when (and (agent-event-type agent)
+             (eql (rtp:rtp-packet-payload-type packet) (agent-event-type agent)))
+    (return-from agent-handle-packet (agent-handle-key agent packet)))
   (let ((decoder (case (rtp:rtp-packet-payload-type packet)
                    (0 #'rtp:ulaw-decode)
                    (8 #'rtp:alaw-decode))))
-    (when (and decoder (plusp (length (rtp:rtp-packet-payload packet))))
+    (when (and decoder (not (agent-waiting agent))
+               (plusp (length (rtp:rtp-packet-payload packet))))
       (dolist (event (vad-push (agent-vad agent)
                                (funcall decoder (rtp:rtp-packet-payload packet))))
         (cond
@@ -118,14 +148,15 @@ GENERATION.  Returns true when the audio was queued."
                    (push sentence spoken))))
           (handler-case
               (multiple-value-bind (reply stop-reason)
-                  (respond (agent-llm agent) (agent-messages agent)
-                           (lambda (piece)
-                             (when (= generation (agent-generation agent))
-                               ;; Speak each sentence as soon as it is complete.
-                               (multiple-value-bind (sentences rest)
-                                   (split-sentences (concatenate 'string pending piece))
-                                 (setf pending rest)
-                                 (mapc #'say sentences)))))
+                  (let ((*call-tools* (agent-tools agent)))
+                    (respond (agent-llm agent) (agent-messages agent)
+                             (lambda (piece)
+                               (when (= generation (agent-generation agent))
+                                 ;; Speak each sentence as soon as it is complete.
+                                 (multiple-value-bind (sentences rest)
+                                     (split-sentences (concatenate 'string pending piece))
+                                   (setf pending rest)
+                                   (mapc #'say sentences))))))
                 (declare (ignore reply))
                 (let ((rest (string-trim '(#\Space #\Newline) pending)))
                   (when (find-if #'alphanumericp rest) (say rest)))
@@ -143,6 +174,37 @@ GENERATION.  Returns true when the audio was queued."
           (push (cons :assistant (format nil "~{~a~^ ~}" (reverse spoken)))
                 (agent-history agent)))))))
 
+;;; Waiting for someone to pick up
+
+(defun ringback-samples (seconds)
+  "The North American ringing tone: 440 and 480 Hz, two seconds on and four
+off, for SECONDS."
+  (let ((samples (make-samples (* 8000 seconds))))
+    (dotimes (i (length samples) samples)
+      (when (< (mod i 48000) 16000)
+        (let ((time (/ i 8000d0)))
+          (setf (aref samples i)
+                (round (* 3000 (+ (sin (* 2 pi 440 time)) (sin (* 2 pi 480 time)))))))))))
+
+(defun agent-wait (agent)
+  "Stop listening to the caller: they are waiting for someone else."
+  (setf (agent-waiting agent) t))
+
+(defun agent-ringback (agent seconds)
+  "Play the ringing tone after whatever is being said, while the caller waits."
+  (when (agent-waiting agent)
+    (audio-out-enqueue (agent-out agent) (ringback-samples seconds))))
+
+(defun agent-resume (agent)
+  "The wait is over and the caller is still with the agent."
+  (when (agent-waiting agent)
+    (audio-out-flush (agent-out agent))
+    (setf (agent-waiting agent) nil)))
+
+(defun agent-say (agent text)
+  "Have the agent say TEXT when it is next free."
+  (agent-post agent (list :say text)))
+
 (defun agent-loop (agent)
   (loop for item = (agent-take agent)
         while item
@@ -150,15 +212,20 @@ GENERATION.  Returns true when the audio was queued."
            (handler-case
                (ecase (first item)
                  (:say (agent-speak agent (second item) (agent-generation agent)))
+                 (:ringback (agent-ringback agent (second item)))
                  (:utterance (agent-turn agent (second item))))
              (error (e) (agent-note agent :error (princ-to-string e))))
            (setf (agent-busy agent) nil)))
 
 ;;; Lifecycle
 
-(defun start-agent (session &key stt llm tts (codec "PCMU") greeting (barge-in t) log vad)
+(defun start-agent (session &key stt llm tts (codec "PCMU") greeting (barge-in t) log vad
+                             tools event-type on-digit)
   "Attach a voice agent to the started RTP SESSION, whose remote address is
-already set.  CODEC is the negotiated audio codec name (PCMU or PCMA)."
+already set.  CODEC is the negotiated audio codec name (PCMU or PCMA).
+TOOLS are tool providers for this call alone.  ON-DIGIT is called with each
+key the caller presses, when EVENT-TYPE is the payload type the call uses
+for telephone events."
   (let* ((agent (make-instance
                  'voice-agent
                  :session session
@@ -167,7 +234,8 @@ already set.  CODEC is the negotiated audio codec name (PCMU or PCMA)."
                                                    #'rtp:alaw-encode
                                                    #'rtp:ulaw-encode))
                  :vad (or vad (make-vad))
-                 :stt stt :llm llm :tts tts :barge-in barge-in :log log)))
+                 :stt stt :llm llm :tts tts :barge-in barge-in :log log
+                 :tools tools :event-type event-type :on-digit on-digit)))
     (setf (rtp:rtp-session-payload-type session) (if (string-equal codec "PCMA") 8 0)
           (rtp:rtp-session-on-packet session)
           (lambda (session packet)

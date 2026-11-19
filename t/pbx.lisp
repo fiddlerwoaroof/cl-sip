@@ -1011,3 +1011,196 @@ registration."
              (is (= 401 (refusal stranger "101")))
              (is (= 404 (refusal carol "999"))))
         (sip:stop stranger)))))
+
+;;; Handing a call from the agent to a phone
+
+(defun press (desk keys)
+  "Press KEYS, a string, on DESK's phone."
+  (loop for key across keys
+        do (rtp:rtp-send-dtmf (desk-session desk) key)
+           (sleep 1/20)))
+
+(defun talking-pbx (spoken &rest args)
+  "A server whose agent's every sentence is pushed onto the list held by
+the function SPOKEN (called with a sentence)."
+  (apply #'start-pbx
+         :tts (voice:make-function-tts (lambda (text)
+                                         (funcall spoken text)
+                                         (tone 1600)))
+         args))
+
+(defmacro with-spoken ((spoken said) &body body)
+  "SPOKEN records sentences; (SAID text) waits until TEXT has been spoken."
+  (let ((list (gensym)) (lock (gensym)))
+    `(let ((,list '()) (,lock (bt:make-lock)))
+       (flet ((,spoken (text) (bt:with-lock-held (,lock) (push text ,list)))
+              (,said (text)
+                (sip:wait-until (lambda ()
+                                  (bt:with-lock-held (,lock)
+                                    (find text ,list :test #'string=)))
+                                :timeout 5)))
+         (declare (ignorable #',said))
+         ,@body))))
+
+(test agent-puts-a-caller-through-by-keypad
+  (with-spoken (spoken said)
+    (with-pbx (server (talking-pbx #'spoken :greeting "Which extension?")
+                      (alice "100" "alice-pw") (bob "101" "bob-pw"))
+      (let* ((caller (open-desk alice))
+             (callee (attend bob :after 1/4))
+             (call (dial caller server "0")))
+        (is-true (wait-for-call call :established))
+        (is-true (said "Which extension?"))
+        (is (= 1 (voice::server-active-calls server)))
+        (press caller "101")
+        ;; Bob's phone rings, showing Alice, while she is told so.
+        (is-true (sip:wait-until (lambda () (desk-call callee))))
+        (is-true (said "Calling Bob."))
+        (let ((from (sip:msg-from (sip:call-invite (desk-call callee)))))
+          (is (string= "Alice" (sip:name-addr-display-name from)))
+          (is (string= "100" (sip:sip-uri-user (sip:name-addr-uri from)))))
+        (is-true (wait-for-call (desk-call callee) :established))
+        ;; The agent has left and the two are bridged.
+        (is-true (sip:wait-until (lambda () (zerop (voice::server-active-calls server)))))
+        (is-true (sip:wait-until
+                  (lambda ()
+                    (let ((bridge (first (voice::server-bridges server))))
+                      (and bridge (eq :connected (voice::bridge-state bridge)))))))
+        (is (eq :established (sip:call-state call)))
+        (sleep 1/4)                     ; the agent's last packets drain
+        (let ((before (desk-count callee 0)))
+          (say caller 10)
+          (is-true (hears callee (+ before 10) 0)))
+        (let ((before (desk-count caller 0)))
+          (say callee 10)
+          (is-true (hears caller (+ before 10) 0)))
+        ;; Either side hanging up ends the other's call.
+        (sip:hangup (desk-call callee))
+        (is-true (wait-for-call call :terminated))
+        (is-true (sip:wait-until (lambda () (null (voice::server-bridges server)))))))))
+
+(test agent-keypad-wrong-numbers-and-no-answer
+  (with-spoken (spoken said)
+    (with-pbx (server (talking-pbx #'spoken :greeting nil :ring-seconds 1/2)
+                      (alice "100" "alice-pw") (bob "101" "bob-pw"))
+      (let* ((caller (open-desk alice))
+             (callee (attend bob :after nil))
+             (call (dial caller server "0")))
+        (is-true (wait-for-call call :established))
+        (is-true (sip:wait-until (lambda () (= 1 (voice::server-active-calls server)))))
+        ;; No extension begins with 9: said at once.
+        (press caller "9")
+        (is-true (said "There is no extension 9."))
+        ;; Carol is listed, but has no phone.
+        (press caller "102")
+        (is-true (said "Carol is not available right now."))
+        ;; Bob's phone rings and is not picked up: the agent comes back.
+        (press caller "101")
+        (is-true (said "Calling Bob."))
+        (is-true (sip:wait-until (lambda () (desk-call callee))))
+        (is-true (said "Bob is not answering. Is there anything else I can do?"))
+        (is-true (wait-for-call (desk-call callee) :terminated))
+        (is (eq :established (sip:call-state call)))
+        (is (= 1 (voice::server-active-calls server)))
+        (is (null (voice::server-bridges server)))
+        ;; A star starts the number again.
+        (press caller "1*101")
+        (is-true (sip:wait-until (lambda () (= 2 (length (desk-calls callee))))))
+        (sip:hangup call)
+        (is-true (wait-for-call call :terminated))
+        (is-true (sip:wait-until (lambda () (zerop (voice::server-active-calls server)))))))))
+
+(test agent-keypad-waits-when-numbers-overlap
+  (let ((pause voice::*digit-pause*))
+    (setf voice::*digit-pause* 1/2)
+    (unwind-protect
+         (with-spoken (spoken said)
+           (with-pbx (server (talking-pbx #'spoken :greeting nil
+                                          :extensions '(("10" :password "dave-pw" :name "Dave")
+                                                        ("100" :password "alice-pw" :name "Alice")
+                                                        ("101" :password "bob-pw" :name "Bob")))
+                             (alice "100" "alice-pw") (dave "10" "dave-pw"))
+             (let* ((caller (open-desk alice))
+                    (callee (attend dave))
+                    (call (dial caller server "0")))
+               (is-true (wait-for-call call :established))
+               (is-true (sip:wait-until (lambda () (= 1 (voice::server-active-calls server)))))
+               ;; 10 could still become 100 or 101: it is rung after a pause.
+               (press caller "10")
+               (is (null (desk-call callee)))
+               (is-true (sip:wait-until (lambda () (desk-call callee))))
+               (is-true (wait-for-call (desk-call callee) :established))
+               (sip:hangup call)
+               (is-true (wait-for-call (desk-call callee) :terminated)))))
+      (setf voice::*digit-pause* pause))))
+
+(defun transfer-input (number)
+  (let ((input (make-hash-table :test 'equal)))
+    (setf (gethash "extension" input) number)
+    input))
+
+(defun asking-pbx (results &rest args)
+  "A server whose stand-in model answers everything the caller says by
+asking to be put through to the number the caller named; what the tool
+returns is pushed with RESULTS."
+  (apply #'start-pbx
+         :stt (voice:make-function-stt (let ((numbers (list "102" "101")))
+                                         (lambda (samples rate)
+                                           (declare (ignore samples rate))
+                                           (pop numbers))))
+         :llm (voice:make-function-llm
+               (lambda (messages)
+                 (let ((tool (first voice::*call-tools*)))
+                   (funcall results
+                            (voice:call-tool tool "transfer_call"
+                                             (transfer-input
+                                              (cdr (first (last messages))))))
+                   "Done.")))
+         args))
+
+(test agent-puts-a-caller-through-when-asked
+  (with-spoken (results returned)
+    (with-pbx (server (asking-pbx #'results :greeting nil)
+                      (alice "100" "alice-pw") (bob "101" "bob-pw"))
+      (let* ((caller (open-desk alice))
+             (callee (attend bob :after 1/2))
+             (call (dial caller server "0")))
+        (is-true (wait-for-call call :established))
+        (is-true (sip:wait-until (lambda () (= 1 (voice::server-active-calls server)))))
+        ;; The model is told who can be reached.
+        (is (search "100 (Alice); 101 (Bob); 102 (Carol)"
+                    (voice::handoff-directory server)))
+        ;; First she asks for Carol, who has no phone: the model hears why.
+        (send-audio (desk-session caller)
+                    (concatenate '(vector (signed-byte 16)) (tone 8000) (silence 6400)))
+        (is-true (returned "Carol is not available right now."))
+        ;; Then for Bob.  She hears ringing until he answers.
+        (sleep 1/2)
+        (let ((before (desk-count caller 0)))
+          (send-audio (desk-session caller)
+                      (concatenate '(vector (signed-byte 16)) (tone 8000) (silence 6400)))
+          (is-true (sip:wait-until (lambda () (desk-call callee))))
+          (is-true (hears caller (+ before 5) 0)))
+        (is-true (wait-for-call (desk-call callee) :established))
+        (is-true (returned "The caller has been put through."))
+        (is-true (sip:wait-until (lambda () (zerop (voice::server-active-calls server)))))
+        (is (= 1 (length (voice::server-bridges server))))
+        (sip:hangup call)
+        (is-true (wait-for-call (desk-call callee) :terminated))))))
+
+(test caller-hangs-up-while-being-put-through
+  (with-spoken (spoken said)
+    (with-pbx (server (talking-pbx #'spoken :greeting nil)
+                      (alice "100" "alice-pw") (bob "101" "bob-pw"))
+      (let* ((caller (open-desk alice))
+             (callee (attend bob :after nil))
+             (call (dial caller server "0")))
+        (is-true (wait-for-call call :established))
+        (is-true (sip:wait-until (lambda () (= 1 (voice::server-active-calls server)))))
+        (press caller "101")
+        (is-true (sip:wait-until (lambda () (desk-call callee))))
+        (sip:hangup call)
+        ;; Bob's phone stops ringing.
+        (is-true (wait-for-call (desk-call callee) :terminated))
+        (is-true (sip:wait-until (lambda () (zerop (voice::server-active-calls server)))))
+        (is (null (voice::server-bridges server)))))))

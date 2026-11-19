@@ -392,6 +392,10 @@ blocks in order and the stop reason."
                       collect block)
               stop-reason))))
 
+(defvar *call-tools* '()
+  "Tool providers that belong to the call being answered, besides the
+model's own: bound by the voice agent around RESPOND.")
+
 (defun claude-tools (llm)
   "The definitions of every tool LLM may call, an alist from tool name to
 provider, and the providers' instructions.  A provider that cannot be reached
@@ -399,7 +403,7 @@ is left out."
   (let ((definitions '())
         (providers '())
         (instructions '()))
-    (dolist (provider (slot-value llm 'tools))
+    (dolist (provider (append (slot-value llm 'tools) *call-tools*))
       (handler-case
           (dolist (definition (list-tools provider))
             (push definition definitions)
