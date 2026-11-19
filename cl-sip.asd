@@ -26,6 +26,7 @@
      (:file "ua")
      (:file "registration")
      (:file "call")
+     (:file "events")
      (:module "sdp"
       :serial t
       :components ((:file "sdp") (:file "offer-answer")))
@@ -82,6 +83,7 @@
      (:file "sdp")
      (:file "rtp")
      (:file "sockets")
+     (:file "events")
      (:file "voice")
      (:file "pbx"))))
   :perform (test-op (o c) (unless (symbol-call :cl-sip.test :run-all)

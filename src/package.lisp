@@ -92,6 +92,13 @@
    ;; calls
    #:call #:invite #:ring #:answer #:reject #:hangup #:reinvite #:update
    #:refer #:call-accept-refer #:call-replaces #:parse-replaces #:find-replaced-call
+
+   ;; events
+   #:subscription #:subscribe #:resubscribe #:unsubscribe
+   #:subscription-state #:subscription-event #:subscription-resource
+   #:subscription-request #:subscription-version #:subscription-user-data
+   #:subscription-on-event #:subscription-notify #:subscription-terminate
+   #:ua-add-event-package #:ua-event-subscriptions
    #:call-state #:call-direction #:call-dialog #:call-invite #:call-on-event
    #:call-local-sdp #:call-remote-sdp #:call-cause #:call-status
    #:call-user-data #:call-ua #:call-auto-answer-reinvite))

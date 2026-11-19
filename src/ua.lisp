@@ -25,6 +25,9 @@ NIL matches any realm.")
                      :accessor ua-on-incoming-call
                      :documentation "(lambda (call)) called for each new INVITE.")
    (registrar :initarg :registrar :initform nil :accessor ua-registrar)
+   (event-packages :initform '() :accessor ua-event-packages
+                   :documentation "Event packages offered to subscribers (events.lisp).")
+   (subscriptions :initform '() :accessor ua-subscriptions)
    (request-filter :initarg :request-filter :initform nil :accessor ua-request-filter
                    :documentation "(lambda (request)) consulted before anything
 else for each new request: true accepts it, a status code refuses it with that
@@ -265,6 +268,10 @@ slots always describe the latest attempt."
   "Dialog id as seen by the UAS: (call-id local-tag remote-tag)."
   (list (msg-call-id request) (msg-to-tag request) (msg-from-tag request)))
 
+(defgeneric handle-dialog-request (owner request tx)
+  (:documentation "A request inside a dialog that OWNER, a call or a
+subscription, holds."))
+
 (defun ua-register-dialog (ua dialog owner)
   (setf (gethash (dialog-id dialog) (ua-dialog-owners ua)) owner))
 
@@ -311,9 +318,10 @@ transaction's From tag, Call-ID and CSeq, but arrived by another path."
       ((not (sip-uri-p (request-uri request)))
        (ua-respond ua tx request 416))
       ((msg-to-tag request)
-       (let ((owner (gethash (dialog-id-of-request request) (ua-dialog-owners ua))))
+       (let ((owner (or (gethash (dialog-id-of-request request) (ua-dialog-owners ua))
+                        (and (string= method "NOTIFY") (ua-adopt-notify ua request)))))
          (if owner
-             (call-handle-request owner request tx)
+             (handle-dialog-request owner request tx)
              (ua-respond ua tx request 481))))
       ((ua-merged-request-p ua request tx)
        (ua-respond ua tx request 482))
@@ -323,6 +331,8 @@ transaction's From tag, Call-ID and CSeq, but arrived by another path."
        (call-handle-new-invite ua request tx))
       ((string= method "REGISTER")
        (registrar-handle-register (ua-registrar ua) ua request tx))
+      ((string= method "SUBSCRIBE")
+       (ua-handle-subscribe ua request tx))
       (t
        ;; BYE (or anything else) outside a dialog.
        (ua-respond ua tx request 481)))))
@@ -351,14 +361,14 @@ transaction's From tag, Call-ID and CSeq, but arrived by another path."
 (defun ua-handle-ack (ua request)
   "An ACK that matched no transaction: the ACK to a 2xx."
   (let ((owner (gethash (dialog-id-of-request request) (ua-dialog-owners ua))))
-    (when owner (call-handle-ack owner request))))
+    (when (typep owner 'call) (call-handle-ack owner request))))
 
 (defun ua-handle-stray-2xx (ua response)
   "A 2xx to an INVITE whose client transaction is gone."
   (let ((owner (gethash (list (msg-call-id response) (msg-from-tag response)
                               (msg-to-tag response))
                         (ua-dialog-owners ua))))
-    (when owner (call-handle-2xx-retransmission owner response))))
+    (when (typep owner 'call) (call-handle-2xx-retransmission owner response))))
 
 ;;;; OPTIONS as a client (section 11.1)
 

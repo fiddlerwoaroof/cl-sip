@@ -439,6 +439,9 @@ into the response: a challenge with 401, a Reason, a Retry-After."
                                         headers)
                        :body body))
 
+(defmethod handle-dialog-request ((call call) request tx)
+  (call-handle-request call request tx))
+
 (defun call-handle-request (call request tx)
   (let ((ua (call-ua call))
         (dialog (call-dialog call))
