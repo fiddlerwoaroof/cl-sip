@@ -572,9 +572,8 @@ softphone ──SIP──▶ phone server (registrar + dialplan) ──▶ voice
   a Python worker (`tools/chatterbox_tts.py`, run by `uv`) that loads the
   model once and takes one request per line; a reference recording sets the
   voice.
-- **Not done yet:** calls between two registered phones (needs a
-  back-to-back UA with an RTP relay), DTMF input, and conversation length
-  limits.
+- **Not done yet:** DTMF input to the agent, and conversation length
+  limits. Calls between registered phones came later: see section 12.
 
 ## 11. Trunking (Flowroute)
 
@@ -606,6 +605,29 @@ address.
   the number called is taken from the To header. Flowroute's documentation
   does not show the inbound Request-URI; the server logs both for each trunk
   call so this can be confirmed on the first one.
-- **Not done:** DNS SRV/NAPTR (RFC 3263; the A records suffice), outbound
-  calls through the trunk, TLS, session timers (RFC 4028, optional for
-  Flowroute), and P-Asserted-Identity handling (RFC 3325).
+- **Not done:** DNS SRV/NAPTR (RFC 3263; the A records suffice), TLS,
+  session timers (RFC 4028, optional for Flowroute), and
+  P-Asserted-Identity handling (RFC 3325). Outbound calls through the trunk
+  came with the PBX work (section 12) and have only been run against a
+  stand-in provider.
+
+## 12. PBX and wiki access (added later)
+
+Two further pieces sit on top of the phone server; each has its own
+description.
+
+- **Extensions, bridged calls and call features**: `docs/pbx-plan.md`. The
+  server relays media between two call legs as a back-to-back user agent,
+  with an extension list, forwarding, hold, transfer, dialling out and busy
+  lamps. The SIP core gained what that needed: UPDATE (RFC 3311), REFER
+  (RFC 3515), SUBSCRIBE/NOTIFY (RFC 6665), a From override and headers on
+  hangup and reject, registrar authentication for other requests, and
+  `rtp-forward`.
+- **Wiki lookups for the agent** (`src/voice/tools.lisp`, the Claude backend
+  in `backends.lisp`): tool providers, of which one speaks MCP over HTTP;
+  described in the README under "Looking things up in the wiki".
+
+The test suite stands at 1232 checks. Everything in this section is tested
+by simulation (stand-in phones and a stand-in provider on loopback, fake
+`curl` for the model and the MCP server); none of it has been run against
+real softphones or the real trunk yet.

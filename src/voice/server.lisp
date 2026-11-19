@@ -209,49 +209,6 @@ sends the INVITE again with credentials."
   "Run FUNCTION off the SIP event loop; media setup and teardown block."
   (bt:make-thread function :name "phone-server-task"))
 
-(defun server-accept-media (server call)
-  "Negotiate audio for CALL.  Returns the RTP session and the codec name, or
-NIL after rejecting the call."
-  (let* ((trunk (eq (call-kind server call) :trunk))
-         (offer (handler-case (sdp:parse-sdp (or (sip:call-remote-sdp call) ""))
-                  (error () nil)))
-         (session (and offer
-                       (rtp:rtp-session-start
-                        (rtp:make-rtp-session :local-host (server-host server) :latch t
-                                              :port-range (server-rtp-port-range server)
-                                              ;; Only the trunk is across a NAT.
-                                              :stun (and trunk (server-stun server))))))
-         (transport (server-transport server)))
-    (multiple-value-bind (answer accepted)
-        (if offer
-            (sdp:make-answer
-             offer
-             ;; The trunk's media comes from the internet, so it needs our
-             ;; public address; a local phone needs the local one.
-             :address (or (and trunk (or (rtp:rtp-session-public-host session)
-                                         (sip:transport-public-host transport)))
-                          (sip:transport-advertised-host transport))
-             :port (or (and trunk (rtp:rtp-session-public-port session))
-                       (rtp:rtp-session-local-port session)))
-            (values nil nil))
-      (cond
-        (accepted
-         (multiple-value-bind (codecs direction remote-host remote-port)
-             (sdp:negotiated-audio answer offer)
-           (declare (ignore direction))
-           (setf (rtp:rtp-session-remote-host session) remote-host
-                 (rtp:rtp-session-remote-port session) remote-port)
-           (sip:answer call :sdp (sdp:sdp-string answer))
-           (values session
-                   (sdp:codec-name
-                    (find-if-not (lambda (c)
-                                   (string-equal (sdp:codec-name c) "telephone-event"))
-                                 codecs)))))
-        (t
-         (when session (in-background (lambda () (rtp:rtp-session-stop session))))
-         (sip:reject call 488)
-         nil)))))
-
 (defun play-then-hang-up (server call session codec samples-function)
   "Play the samples SAMPLES-FUNCTION returns, then end the call."
   (let ((out (make-audio-out session :encoder (if (string-equal codec "PCMA")
@@ -342,21 +299,13 @@ NIL after rejecting the call."
       ((and (consp action) (eq (first action) :reject))
        (sip:reject call (or (second action) 486)))
       (t
-       (let ((stop nil) (session nil) (codec nil))
-         (setf (sip:call-on-event call)
-               (lambda (call event &key cause &allow-other-keys)
-                 (case event
-                   (:established
-                    (setf stop (server-start-media server call action session codec)))
-                   (:terminated
-                    (server-log server "call from ~a ended (~(~a~))" (call-caller call) cause)
-                    (when (and agent session) (decf (server-active-calls server)))
-                    (when stop (funcall stop))
-                    (when session
-                      (let ((session session))
-                        (in-background (lambda () (rtp:rtp-session-stop session)))))))))
-         (multiple-value-setq (session codec) (server-accept-media server call))
-         (when (and agent session) (incf (server-active-calls server))))))))
+       ;; Answered here: the agent, the echo, an announcement.
+       (let ((a (server-open-leg server :call call :trunk (eq kind :trunk))))
+         (cond ((leg-answer-offer server a (sip:call-remote-sdp call))
+                (server-answer-with server a action))
+               (t
+                (leg-close a)
+                (sip:reject call 488))))))))
 
 ;;; Server
 

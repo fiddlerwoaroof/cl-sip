@@ -727,12 +727,18 @@ once if it already is (a call transferred to the agent)."
              (setf (leg-held a) nil
                    stop (server-start-media server call action
                                             (leg-session a) (leg-codec a)))))
-      (setf (sip:call-auto-answer-reinvite call) t
+      (setf (sip:call-auto-answer-reinvite call) nil
             (sip:call-accept-refer call) nil
             (sip:call-on-event call)
-            (lambda (call event &key cause &allow-other-keys)
+            (lambda (call event &key cause sdp &allow-other-keys)
               (case event
                 (:established (begin))
+                (:reinvite
+                 ;; A hold, a resume or a change of address from the phone:
+                 ;; answered from what it offers (RFC 3264 section 8).
+                 (cond ((null sdp) (sip:answer call :sdp (leg-sdp-text a)))
+                       ((leg-answer-offer server a sdp) (sip:answer call :sdp (leg-sdp-text a)))
+                       (t (sip:reject call 488))))
                 (:terminated
                  (server-log server "call from ~a ended (~(~a~))" (call-caller call) cause)
                  (when agent (decf (server-active-calls server)))

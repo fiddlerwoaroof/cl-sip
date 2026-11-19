@@ -902,6 +902,33 @@ registration."
       (rtp:rtp-session-stop out)
       (rtp:rtp-session-stop sink))))
 
+;;; Calls the server answers itself follow the same offer/answer rules.
+
+(test holding-a-call-to-the-agent
+  (with-pbx (server (start-pbx :greeting "Hello.") (alice "100" "alice-pw"))
+    (multiple-value-bind (on-event events) (recorder)
+      (let* ((caller (open-desk alice))
+             (call (dial caller server "0" :on-event on-event)))
+        (is-true (wait-for-call call :established))
+        (is-true (hears caller 10))
+        (flet ((answered-direction ()
+                 (audio-direction
+                  (getf (cdr (find :reinvite-accepted (reverse (funcall events)) :key #'car))
+                        :sdp))))
+          ;; Held: the answer says the server will only listen.
+          (sip:reinvite call :sdp (sdp:sdp-string
+                                   (sdp:hold (sdp:parse-sdp (sip:call-local-sdp call)))))
+          (is-true (sip:wait-until
+                    (lambda () (find :reinvite-accepted (funcall events) :key #'car))))
+          (is (eq :recvonly (answered-direction)))
+          (sip:reinvite call :sdp (sdp:sdp-string
+                                   (sdp:resume (sdp:parse-sdp (sip:call-local-sdp call)))))
+          (is-true (sip:wait-until
+                    (lambda () (= 2 (count :reinvite-accepted (funcall events) :key #'car)))))
+          (is (eq :sendrecv (answered-direction))))
+        (sip:hangup call)
+        (is-true (wait-for-call call :terminated))))))
+
 ;;; Busy lamps: dialog state of an extension (RFC 4235)
 
 (defun lamp-states (events)

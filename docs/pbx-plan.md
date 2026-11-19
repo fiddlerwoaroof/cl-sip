@@ -170,7 +170,19 @@ as the voice tests do. No phase needs a real softphone or the real trunk.
 
 ## 4. Status
 
-Updated as phases land.
+All seven phases are implemented and tested by simulation only: stand-in
+phones are user agents on loopback sockets, the provider is another. Nothing
+here has been tried with a real softphone or against Flowroute. Things to
+look at first when that happens:
+
+- Softphones differ in how they hold (`sendonly`, `inactive`, or the old
+  `c=0.0.0.0`; the last is not recognised as a hold) and in whether they
+  send REFER inside the call's dialog (assumed) or outside it (refused).
+- A phone that insists on `Require: 100rel`, `replaces` or `timer` gets
+  420; one that merely lists them in `Supported` is fine.
+- An INVITE without a session description (a late offer) is refused with
+  488 on calls the server bridges or answers.
+- Dialling out: see the questions at the end of phase 6.
 
 | Phase | State |
 |---|---|
