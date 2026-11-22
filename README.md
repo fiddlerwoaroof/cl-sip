@@ -1,29 +1,40 @@
 # cl-sip
 
-A basic SIP user-agent stack in Common Lisp, written from the RFCs in
-`docs/rfcs/`: RFC 3261 (with the transaction fixes of RFC 6026 and RFC 4320
-and `rport` from RFC 3581), digest authentication (RFC 7616, RFC 8760), SDP
-and offer/answer (RFC 8866, RFC 3264), and enough RTP to move G.711 audio
-and DTMF events (RFC 3550, RFC 3551, RFC 4733).
+A SIP user agent in Common Lisp, with SDP, enough RTP for G.711 audio and
+DTMF, and a phone server that answers calls with a Claude voice agent and
+can act as a small PBX.
 
-It can register, place and receive calls, cancel, hang up, and re-INVITE,
-over UDP or TCP. It is not a proxy and has no TLS; see
-[`docs/implementation-plan.md`](docs/implementation-plan.md) for the design,
-the full scope, and the list of what is left out.
+The stack follows RFC 3261 (with the transaction fixes of RFC 6026 and
+RFC 4320, and `rport` from RFC 3581), digest authentication (RFC 7616,
+RFC 8760), SDP offer/answer (RFC 8866, RFC 3264) and RTP (RFC 3550,
+RFC 3551, RFC 4733). The RFC texts are in `docs/rfcs/`.
+
+It can register, place and receive calls, cancel, hang up, re-INVITE, send
+UPDATE and REFER, and subscribe to and send event notifications (RFC 6665),
+over UDP or TCP. It is not a proxy and has no TLS or SRTP.
+[`docs/implementation-plan.md`](docs/implementation-plan.md) covers the
+design and what is left out.
 
 ## Loading
 
-Dependencies: `alexandria`, `babel`, `bordeaux-threads`, `ironclad`,
-`usocket` (plus `com.inuoe.jzon` for `cl-sip/voice` and `fiveam` for the
-tests), all in Quicklisp. Developed on SBCL.
+Requires SBCL and Quicklisp. Dependencies: `alexandria`, `babel`,
+`bordeaux-threads`, `ironclad`, `usocket`; `com.inuoe.jzon` for
+`cl-sip/voice`; `fiveam` for the tests.
 
 ```lisp
 (push #p"/path/to/cl-sip/" asdf:*central-registry*)
 (ql:quickload "cl-sip")
-(asdf:test-system "cl-sip")      ; runs the test suite
+(asdf:test-system "cl-sip")
 ```
 
-## Quick start
+| System | Contents |
+|---|---|
+| `cl-sip` | The SIP stack, SDP (`cl-sip.sdp`) and RTP (`cl-sip.rtp`) |
+| `cl-sip/voice` | The phone server and voice agent (`cl-sip.voice`) |
+| `cl-sip/examples` | Example programs (`cl-sip.examples`) |
+| `cl-sip/test` | The test suite |
+
+## Using the stack
 
 ```lisp
 (defvar *ua*
@@ -34,13 +45,13 @@ tests), all in Quicklisp. Developed on SBCL.
 
 (cl-sip:start *ua*)
 
-;; Register, refreshing automatically.
+;; Register. The registration refreshes itself.
 (defvar *registration*
   (cl-sip:register *ua* :expires 3600
                         :on-event (lambda (registration event &key &allow-other-keys)
                                     (print (list registration event)))))
 
-;; Receive calls.
+;; Answer incoming calls.
 (setf (cl-sip:ua-on-incoming-call *ua*)
       (lambda (call)
         (let ((offer (cl-sip.sdp:parse-sdp (cl-sip:call-remote-sdp call))))
@@ -58,19 +69,23 @@ tests), all in Quicklisp. Developed on SBCL.
                              ;; :progress :ringing :established :terminated ...
                              (print (list event (cl-sip:call-state call))))))
 
-(cl-sip:hangup *call*)            ; CANCEL, rejection or BYE as the state requires
+(cl-sip:hangup *call*)            ; sends CANCEL, a rejection or BYE, as needed
 (cl-sip:unregister *registration*)
 (cl-sip:stop *ua*)
 ```
 
-Callbacks run on the stack's event-loop thread, so keep them short and do
-not block in them; they may call any `cl-sip` function. Calls from other
-threads are handed to the loop for you. `cl-sip:wait-until` polls for a
-condition from an application thread.
+Callbacks run on the stack's event-loop thread. Keep them short and don't
+block in them. They may call any `cl-sip` function. Calls made from other
+threads are passed to the loop automatically. `cl-sip:wait-until` waits for
+a condition from an application thread.
 
-`examples/` has three runnable programs (`(ql:quickload "cl-sip/examples")`):
-`register-example`, `start-echo-uas` (answers and echoes the caller's RTP),
-and `call-example` (calls a URI, sends a tone and a DTMF digit).
+### Examples
+
+`(ql:quickload "cl-sip/examples")` loads three programs:
+
+- `register-example` registers with a server.
+- `start-echo-uas` answers calls and echoes the caller's RTP.
+- `call-example` calls a URI, sends a tone and a DTMF digit, and hangs up.
 
 ```lisp
 (defvar *uas* (cl-sip.examples:start-echo-uas :port 5070))
@@ -78,30 +93,35 @@ and `call-example` (calls a URI, sends a tone and a DTMF digit).
 ;; => :LOCAL-HANGUP, 57
 ```
 
-## Calling a model from a softphone
+## The phone server
 
-`cl-sip/voice` is a small phone server. A softphone registers with it (or
-just dials it), and the call is answered by a voice agent: the caller's
-speech is transcribed locally with whisper.cpp, sent to Claude Haiku 5.5
-through the Messages API, and the streamed reply is spoken back sentence by
-sentence. Talking over the agent interrupts it.
+`cl-sip/voice` is a phone server. Softphones register with it or dial it
+directly. A call to the agent goes like this:
 
-The tools come from the flake's dev shell (`whisper-cli`, `curl`, the whisper
-model as `$WHISPER_MODEL`, and `pjsua` for testing); speech is synthesized
-with the macOS `say` command. The server needs `ANTHROPIC_API_KEY` in its
-environment.
+1. whisper.cpp transcribes the caller's speech locally.
+2. The text goes to Claude (Haiku 5.5 by default) through the Messages API.
+3. The reply is spoken back one sentence at a time as it streams in.
+
+If the caller talks over the agent, the agent stops speaking.
+
+### Running it
+
+The Nix flake's dev shell provides `whisper-cli`, `curl`, the whisper model
+(`$WHISPER_MODEL`) and `pjsua` for testing. Speech is synthesized with the
+macOS `say` command by default. The server needs `ANTHROPIC_API_KEY`.
 
 ```sh
 bin/voice-server            # check the configuration, then run
 bin/voice-server --check    # check only
+bin/voice-server --help     # list the settings
 ```
 
-The script loads the dev shell itself, reads `.envrc.local` if present,
-reports each setting as ok or as a problem (never printing values), and
-starts the server on 127.0.0.1:5060 (UDP and TCP) once everything required
-is there. Ctrl-C stops it and removes any trunk registration.
+The script enters the dev shell if needed, loads `.envrc.local` if it
+exists, and reports each setting as ok or as a problem without printing
+values. It then starts the server on 127.0.0.1:5060 (UDP and TCP). Ctrl-C
+stops it and removes any trunk registration.
 
-or from a REPL started inside the dev shell:
+From a REPL inside the dev shell:
 
 ```lisp
 (ql:quickload "cl-sip/voice")
@@ -109,44 +129,42 @@ or from a REPL started inside the dev shell:
 (cl-sip.voice:stop-server *server*)
 ```
 
-Then point a softphone on the same Mac at it:
+### Connecting a softphone
 
 | Setting | Value |
 |---|---|
-| SIP server / domain | `127.0.0.1` (port 5060) |
+| SIP server / domain | `127.0.0.1`, port 5060 |
 | User name | anything, e.g. `100` |
-| Password | anything (registration is open unless `:users` is given) |
+| Password | anything (unless you configure extensions or `:users`) |
 | Transport | UDP or TCP |
-| Encryption (SRTP, TLS) | off |
+| SRTP / TLS | off |
 
-and dial:
-
-| Extension | What answers |
+| Dial | Result |
 |---|---|
-| `600` | Echo test: you hear yourself |
-| `700` | A spoken test message, then it hangs up |
+| `600` | Echo test |
+| `700` | A spoken test message, then hang-up |
 | anything else | The voice agent |
 
-The routing is the `:dialplan` argument (see `*default-dialplan*`): patterns
-map to `:agent`, `:echo`, `(:say "text")`, `(:play "file.wav")`,
-`(:reject status)` or a function of your own.
+The `:dialplan` argument controls routing (default: `*default-dialplan*`).
+Each entry maps a pattern to `:agent`, `:echo`, `(:say "text")`,
+`(:play "file.wav")`, `(:reject status)` or a function.
 
-Only this machine may register and call by default; requests from anywhere
-else are dropped without an answer. To let other devices on your network
-in, listen on all interfaces and name the network:
+By default only the local machine can register and call. Requests from
+other addresses are dropped without a response. To allow devices on your
+network:
 
 ```sh
 VOICE_HOST=0.0.0.0 VOICE_ALLOW=192.168.1.0/24 bin/voice-server
 ```
 
-Each stage is replaceable: `start-server` takes `:stt`, `:llm` and `:tts`
-objects. `make-claude-llm` accepts `:model`, `:system` and `:effort`, and
+`start-server` takes `:stt`, `:llm` and `:tts` objects, so each stage can be
+replaced. `make-claude-llm` accepts `:model`, `:system` and `:effort`;
 `make-say-tts` accepts `:voice`.
 
-### Connecting a phone number (Flowroute)
+### A phone number (Flowroute)
 
-With SIP credentials in the environment the server registers with Flowroute,
-and calls to your number are answered by the agent:
+If Flowroute SIP credentials are set, the server registers with Flowroute
+and the agent answers calls to your number:
 
 ```sh
 export FLOWROUTE_USERNAME=...     # the tech prefix (Interconnections > Registration)
@@ -156,29 +174,35 @@ bin/voice-server
 ```
 
 In the Flowroute portal, route the number to "SIP registration" on the same
-point of presence. The server then listens on all interfaces, registers,
-learns its public address from Flowroute's replies, re-registers with it,
-and sends a keep-alive every 25 seconds so the router keeps the path open.
-Requests are accepted only from this machine, `VOICE_ALLOW` networks, and
-Flowroute's signalling addresses.
+point of presence.
 
-Flowroute does not relay audio: it flows directly between the carrier's
-gateway and this machine, so the audio port has to be reachable through your
-router. Pick one:
+With a trunk configured, the server:
+
+- listens on all interfaces,
+- learns its public address from Flowroute's responses and re-registers
+  with it,
+- sends a keep-alive every 25 seconds to hold the NAT mapping open,
+- accepts requests only from the local machine, `VOICE_ALLOW` networks and
+  Flowroute's signalling addresses.
+
+Flowroute does not relay audio. Audio travels directly between the
+carrier's gateway and your machine, so your router must let the RTP port
+through:
 
 | Option | Setting | Notes |
 |---|---|---|
-| Port forwarding | `VOICE_RTP_PORTS=40000-40019`, and forward that UDP range to this machine | Dependable. Each call uses one port from the range. |
-| STUN | `VOICE_STUN=host:port` | No router changes; does not work behind routers that give each destination a different port. |
-| Neither | | Works only if the router keeps port numbers unchanged. |
+| Port forwarding | `VOICE_RTP_PORTS=40000-40019`, with that UDP range forwarded to this machine | Most reliable. Each call uses one port. |
+| STUN | `VOICE_STUN=host:port` | No router changes. Fails behind symmetric NAT. |
+| Neither | | Works only if the router preserves port numbers. |
 
-Other settings: `VOICE_ALLOWED_CALLERS=2065550199,...` answers only those
-callers (each call spends API tokens), and `VOICE_MAX_CALLS` (default 2)
-caps simultaneous agent calls. A trunk call is routed by the number that was
-called, so a dialplan entry such as `("12065550100" :agent)` applies to it;
-the default dialplan sends everything to the agent.
+Every agent call costs API tokens. Use `VOICE_ALLOWED_CALLERS` to restrict
+who the agent answers, and `VOICE_MAX_CALLS` (default 2) to limit
+concurrent agent calls.
 
-From Lisp the same thing is the `:trunk` argument:
+Trunk calls are routed by the called number, so a dialplan entry like
+`("12065550100" :agent)` applies to them.
+
+The same configuration from Lisp:
 
 ```lisp
 (cl-sip.voice:start-server
@@ -189,15 +213,19 @@ From Lisp the same thing is the `:trunk` argument:
  :allowed-callers '("2065550199"))
 ```
 
-Placing calls out through the trunk is not implemented yet.
+To debug a trunk, set `VOICE_SIP_TRACE=trunk` to log the SIP messages
+exchanged with the provider, or `all` to log every message. Credentials are
+removed from the log.
 
 ### Extensions
 
-Give the server a list of extensions and it becomes a small PBX: phones
-register under their numbers and call each other, with the server relaying
-the audio. Put the list in `extensions.lisp` next to the flake (it is
-git-ignored, since it holds passwords), or name another file with
-`VOICE_EXTENSIONS`:
+With an extension list, the server works as a small PBX. Phones register
+under their extension numbers and call each other, and the server relays
+the audio.
+
+Put the list in `extensions.lisp` in the repository root, or name a
+different file with `VOICE_EXTENSIONS`. `extensions.lisp` is git-ignored
+because it contains passwords.
 
 ```lisp
 ("100" :password "s3cret" :name "Alice")
@@ -205,102 +233,104 @@ git-ignored, since it holds passwords), or name another file with
 ("200" :ring ("100" "101") :name "Front desk")   ; a group: both phones ring
 ```
 
-Each softphone then uses its number as the user name and its password, with
-the server's address as the SIP server. With a list in place only those
-extensions can register, each only as itself, and every call a phone places
-is authenticated. Dialling an extension rings every phone registered for it
-(or for each member of a group); the first to answer gets the call. Numbers
-that are not extensions go to the dialplan as before, so the agent still
-answers anything else, and trunk callers can be routed to phones by listing
-your Flowroute number as a group, e.g. `("12065550100" :ring ("100"))`.
+Each softphone uses its extension number as the user name, its password,
+and the server's address. Once a list exists:
 
-An extension can send its calls elsewhere: `:forward` always, `:busy` when
-its phone is busy or declines, `:no-answer` when nobody picks up within
-`:ring-seconds` (default `VOICE_RING_SECONDS`, 30) or no phone is registered.
-The target is another number or `:agent`:
+- only listed extensions can register, each only as itself;
+- every call a phone places must authenticate;
+- dialling an extension rings all phones registered to it (or to each
+  member of a group), and the first to answer takes the call;
+- numbers that aren't extensions still go through the dialplan.
+
+To send trunk calls to phones, list your Flowroute number as a group:
+`("12065550100" :ring ("100"))`.
+
+**Forwarding.** `:forward` forwards every call. `:busy` applies when the
+phone is busy or declines. `:no-answer` applies when nobody answers within
+`:ring-seconds` (default `VOICE_RING_SECONDS`, 30) or no phone is
+registered. The target is an extension number or `:agent`.
 
 ```lisp
 ("101" :password "hunter2" :name "Bob" :busy "100" :no-answer :agent)
 ```
 
-The phone that ends up ringing is told where the call has been
-(`History-Info`), and a call forwarded more than five times is taken for a
-loop and refused.
+The phone that finally rings gets the call's forwarding history in
+`History-Info`. A call forwarded more than five times is refused as a loop.
 
-Hold and transfer work from the phone's own buttons. A held party's phone
-is told it is on hold. A transfer, blind or after consulting the third
-party on a second call, is carried out by the server: the parties that
-remain are joined and the phone that transferred is released, or, if the
-target does not answer, the original call carries on. Calls can be
-transferred to the agent like any other number.
+**Hold and transfer.** These work from the phone's own buttons. The server
+carries out blind and attended transfers itself. It joins the remaining
+parties and releases the transferring phone. If the transfer target doesn't
+answer, the original call continues. You can transfer a call to the agent.
 
-The agent can put a caller through to an extension. The caller either keys
-the number (`#` ends it, `*` starts over) or asks for a person, a group or a
-number, which the model acts on with its `transfer_call` tool; it is told
-the numbers and names in the list. The caller hears ringing while the
-phones ring. When one answers, the agent leaves the call; when none does,
-the agent says so and carries on. Only listed extensions and groups can be
-reached this way, never an outside number. To make the agent an attendant
-for calls from outside, give it a fitting greeting:
+**Attendant.** The agent can connect a caller to an extension. The caller
+either types the number on the keypad (`#` to finish, `*` to start over) or
+asks for a person, group or number. The agent knows the names and numbers
+in the list and connects the call with its `transfer_call` tool. The caller
+hears ringing. If someone answers, the agent drops off; if not, the agent
+says so and continues the conversation. The agent can only reach listed
+extensions and groups, never outside numbers.
+
+To make the agent greet outside callers as an attendant:
 
 ```sh
 export VOICE_GREETING="Hello. Which extension should I dial?"
 ```
 
-To let phones call telephone numbers through the trunk, set
-`VOICE_OUTBOUND_CALLER_ID` to one of your Flowroute numbers and mark the
-extensions that may do so:
+**Outbound calls.** Set `VOICE_OUTBOUND_CALLER_ID` to one of your Flowroute
+numbers and mark the extensions allowed to dial out:
 
 ```lisp
 ("100" :password "s3cret" :name "Alice" :outbound t)
 ```
 
-Ten- and eleven-digit numbers dialled from such a phone then go to the
-provider, shown as coming from that number. Without the setting nobody can
-dial out, and a call that arrived from the trunk is never sent back out. A
-forwarding target may be an outside number if the forwarding extension is
-marked `:outbound`. This has been exercised against a stand-in provider
-only, not yet against Flowroute itself.
+Ten- and eleven-digit numbers dialled from those phones go to the provider,
+with that number as the caller ID. Calls that arrived from the trunk are
+never sent back out. A forwarding target may be an outside number if the
+forwarding extension is `:outbound`. So far this has only been tested
+against a stand-in provider, not against Flowroute.
 
-A softphone's busy lamps (BLF) can follow other extensions: the server
-answers subscriptions to the `dialog` event of an extension and reports it
-ringing, in a call, or idle.
+**Busy lamps.** Softphones can subscribe to an extension's `dialog` event.
+The server reports the extension as ringing, in a call, or idle.
 
-The design, the RFCs each part follows, and what is left out (voicemail and
-message waiting, call pickup, conferences, music on hold) are in
-`docs/pbx-plan.md`.
+[`docs/pbx-plan.md`](docs/pbx-plan.md) describes the design and which RFCs
+each feature follows. It also lists what isn't implemented: voicemail and
+message waiting, call pickup, conferences, and music on hold.
 
-### Looking things up in the wiki
+### Wiki lookups
 
-With a capability token for the LLM-wiki MCP server, the agent can consult
-the wiki during a call. Put the token in `.envrc.local`:
+With a token for the LLM-wiki MCP server, the agent can look things up in
+the wiki during a call. Put these in `.envrc.local`:
 
 ```sh
 VOICE_WIKI_TOKEN=...                           # must carry the mcp capability
 VOICE_WIKI_URL=http://localhost:8788/mcp       # the default
 ```
 
-`bin/voice-server` then checks that the wiki accepts the token. The server's
-tools are offered to the model, apart from `ask_wiki`: it has a local model
-write the answer, which takes longer than a caller will wait, so the agent
-follows the same routine itself, a turn at a time: whatever the caller says
-is searched for (about 0.2 s) and the hits go to the model with their words;
-it reads the most promising pages, searches again if they miss, and answers
-briefly from them, ready for a follow-up. The wiki's catalog (`index`) rides
-along in the system prompt as a map of what exists; it is long, so it is
-marked for prompt caching and costs little after a call's first turn. `VOICE_WIKI_EXCLUDE`, a
-comma-separated list, changes which tools are withheld. The model says a few words ("Let me check"),
-calls a tool, and answers from the result; each call appears in the log as a
-`tool:` line. If the wiki is down or refuses the token, the agent carries on
-without it and the log says why; a wiki that does not answer is left alone
-for a minute, so it costs a caller one five-second wait rather than one per
-turn. Lookups last for one reply: what was said
-is remembered for the rest of the call, the pages read are not.
+`bin/voice-server` checks that the wiki accepts the token.
 
-Anyone who reaches the agent can ask it about the wiki, so set
+The agent can use all of the wiki's tools except `ask_wiki`, which is too
+slow for a phone call. Set `VOICE_WIKI_EXCLUDE` (comma-separated) to change
+which tools are withheld. Instead of `ask_wiki`, the agent does the lookup
+itself on each turn:
+
+1. It searches for what the caller said (about 0.2 s).
+2. It reads the most relevant pages, searching again if needed.
+3. It answers briefly from those pages.
+
+The wiki's `index` is included in the system prompt with prompt caching, so
+it costs little after the first turn of a call. Before calling a tool, the
+agent says something short like "Let me check". Each tool call is logged as
+a `tool:` line. Pages the agent reads are kept for one reply only; the
+conversation itself is kept for the whole call.
+
+If the wiki is down or rejects the token, the agent continues without it
+and logs the reason. If the wiki doesn't respond, the agent leaves it alone
+for a minute, so a caller waits five seconds once rather than on every turn.
+
+Anyone who reaches the agent can ask it about the wiki. Set
 `VOICE_ALLOWED_CALLERS` when a trunk is connected.
 
-From Lisp, any MCP server reached over HTTP works, as do plain functions:
+From Lisp, any MCP server over HTTP works, and so do plain functions:
 
 ```lisp
 (cl-sip.voice:start-server
@@ -312,13 +342,12 @@ From Lisp, any MCP server reached over HTTP works, as do plain functions:
                      (lambda (input) (declare (ignore input)) "half past nine")))))
 ```
 
-### A cloned voice
+### Voice cloning
 
-`make-chatterbox-tts` speaks with the Chatterbox Turbo model, which can
-imitate a voice from a short reference recording (about ten seconds of clean
-speech). It runs `tools/chatterbox_tts.py` under `uv` as a worker that keeps
-the model loaded; the first start downloads the model (4 GB) unless it is
-already in the Hugging Face cache.
+`make-chatterbox-tts` uses the Chatterbox Turbo model, which can imitate a
+voice from about ten seconds of clean recorded speech. It runs
+`tools/chatterbox_tts.py` under `uv` as a long-running worker. The first run
+downloads the model (4 GB) unless it's already in the Hugging Face cache.
 
 ```sh
 VOICE_TTS=chatterbox VOICE_REFERENCE=me.wav bin/voice-server
@@ -329,38 +358,75 @@ VOICE_TTS=chatterbox VOICE_REFERENCE=me.wav bin/voice-server
  :tts (cl-sip.voice:make-chatterbox-tts :voice "me.wav"))
 ```
 
-On an Apple Silicon laptop it takes about as long to synthesize a sentence
-as to speak it, so replies start two to three seconds later than with `say`,
-and loading takes around half a minute.
+On an Apple Silicon laptop, synthesizing a sentence takes about as long as
+speaking it. Replies start two to three seconds later than with `say`, and
+the model takes about 30 seconds to load.
 
-Other models plug in the same way: `make-worker-tts` runs any long-lived
-program that speaks the worker's line protocol (see the script's header),
-and `make-command-tts` runs a program once per sentence:
+Other speech programs can be used too. `make-worker-tts` runs a long-lived
+program that speaks the worker protocol described in the script's header.
+`make-command-tts` runs a program once per sentence:
 
 ```lisp
 (cl-sip.voice:make-command-tts '("my-tts" "--text" :text "--out" :output))
 ```
 
+### Settings
+
+`bin/voice-server` reads these from the environment or `.envrc.local`.
+
+| Variable | Meaning |
+|---|---|
+| `ANTHROPIC_API_KEY` | Claude API key (required) |
+| `VOICE_HOST`, `VOICE_PORT` | Listen address. Default 127.0.0.1 (0.0.0.0 with a trunk), port 5060 |
+| `VOICE_ALLOW` | Comma-separated networks allowed to register and call |
+| `VOICE_GREETING` | What the agent says when it answers |
+| `VOICE_EXTENSIONS` | Extension list file. Default `extensions.lisp` if present |
+| `VOICE_RING_SECONDS` | How long an extension rings. Default 30 |
+| `FLOWROUTE_USERNAME`, `FLOWROUTE_PASSWORD` | Trunk credentials. Set both or neither |
+| `FLOWROUTE_POP` | `us-west-or` (default) or `us-east-va` |
+| `VOICE_RTP_PORTS` | UDP port range forwarded to this machine, e.g. `40000-40019` |
+| `VOICE_STUN` | STUN server, `host:port` |
+| `VOICE_ALLOWED_CALLERS` | Comma-separated numbers the agent answers |
+| `VOICE_MAX_CALLS` | Maximum concurrent agent calls. Default 2 |
+| `VOICE_OUTBOUND_CALLER_ID` | Your Flowroute number. Lets `:outbound` extensions dial out |
+| `VOICE_SIP_TRACE` | `trunk` or `all`. Logs SIP messages, without credentials |
+| `VOICE_WIKI_TOKEN` | LLM-wiki MCP token |
+| `VOICE_WIKI_URL` | Wiki server address. Default `http://localhost:8788/mcp` |
+| `VOICE_WIKI_EXCLUDE` | Wiki tools to withhold. Default `ask_wiki` |
+| `VOICE_TTS` | `chatterbox` to use the voice-cloning model |
+| `VOICE_REFERENCE` | Voice recording for Chatterbox to imitate |
+
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `src/uri.lisp`, `headers.lisp`, `message.lisp`, `parser.lisp`, `serializer.lisp` | Message codec |
-| `src/auth.lisp` | Digest authentication, client and server side |
+| `src/uri.lisp`, `headers.lisp`, `message.lisp`, `parser.lisp`, `serializer.lisp` | Message parsing and serialization |
+| `src/auth.lisp` | Digest authentication, client and server |
 | `src/scheduler.lisp` | Event loop with a real or virtual clock |
-| `src/transport*.lisp` | Transport layer; in-memory, UDP and TCP transports |
+| `src/transport*.lisp` | In-memory, UDP and TCP transports |
 | `src/transaction.lisp` | Client and server transaction state machines |
-| `src/dialog.lisp`, `ua.lisp`, `registration.lisp`, `call.lisp` | Dialogs and the UA core |
-| `src/sdp/` | Package `cl-sip.sdp`: SDP and offer/answer |
-| `src/rtp/` | Package `cl-sip.rtp`: RTP packets, G.711, DTMF, a simple session |
-| `src/voice/` | Package `cl-sip.voice`: audio helpers, voice agent, tools (MCP client), phone server |
-| `t/` | Tests; protocol tests run on a virtual clock over an in-memory network |
+| `src/dialog.lisp`, `ua.lisp`, `registration.lisp`, `call.lisp` | Dialogs and the user agent core |
+| `src/events.lisp` | SUBSCRIBE and NOTIFY |
+| `src/sdp/` | SDP and offer/answer |
+| `src/rtp/` | RTP packets, G.711, DTMF, STUN, a simple RTP session |
+| `src/voice/` | Phone server, voice agent, speech backends, MCP client, call bridging |
+| `t/` | Tests |
+| `bin/voice-server` | Launcher for the phone server |
+| `docs/` | Design notes and RFC texts |
 
-## Testing without a network
+## Tests
 
-The protocol tests never sleep: agents share a virtual scheduler and an
-in-memory network, so a test can lose or duplicate chosen messages and step
+```lisp
+(asdf:test-system "cl-sip")
+```
+
+The protocol tests don't sleep. User agents share a virtual clock and an
+in-memory network, so a test can drop or duplicate specific messages and run
 through 32 seconds of retransmission timers instantly. `t/harness.lisp`
-shows how; the same pieces (`make-scheduler :virtual t`,
+shows how. The same functions (`make-scheduler :virtual t`,
 `make-memory-network`, `make-memory-transport`, `pump`, `advance-time`) are
 exported for use at the REPL.
+
+## License
+
+MIT.
